@@ -1,0 +1,5 @@
+telethon>=1.41,<2
+python-dotenv>=1.0,<2
+pytesseract>=0.3.13,<1
+Pillow>=10,<13
+opencv-python>=4.10,<5
