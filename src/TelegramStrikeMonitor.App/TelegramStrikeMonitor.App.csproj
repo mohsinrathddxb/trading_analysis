@@ -3,11 +3,19 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <RollForward>Major</RollForward>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>TelegramStrikeMonitor</AssemblyName>
     <RootNamespace>TelegramStrikeMonitor.App</RootNamespace>
+    <Version>1.2.2</Version>
+    <ApplicationIcon>Assets\AppLogo.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\AppLogo.ico" />
+    <Resource Include="Assets\AppLogo.png" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\python\live_strike_monitor.py">
@@ -24,6 +32,14 @@
     </None>
     <None Include="..\..\python\.env.example">
       <Link>python\.env.example</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\python\authorize_telegram.py">
+      <Link>python\authorize_telegram.py</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\update-app.ps1">
+      <Link>update-app.ps1</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

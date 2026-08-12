@@ -22,18 +22,23 @@ from live_strike_monitor import (  # noqa: E402
     StrikeRow,
     analyze_market_window,
     apply_intraday_option_signal,
+    build_market_report,
+    build_recent_instrument_report,
     build_timeframe_report,
     combine_timeframe_analyses,
     compare_snapshots,
+    evaluate_pending_option_outcomes,
     estimate_option_probabilities,
     estimate_support_resistance,
     extract_intraday_trend_rows,
     extract_latest_intraday_signals,
     find_previous_internal_snapshot,
+    grouped_independent_returns,
     image_day_folder_name,
     infer_expiry,
     load_config,
     locate_option_chain_columns,
+    option_probability_lines,
     parse_strike_rows,
     rank_timeframe_oi_movers,
     rank_strike_oi_movers,
@@ -547,6 +552,98 @@ class PredictionLogicTests(unittest.TestCase):
         self.assertEqual("FLAT", combined.predicted_label)
         self.assertIn("Timeframe agreement", combined.reasons[0])
 
+    def test_easy_report_has_all_timeframes_and_exact_prices(self) -> None:
+        rows = [
+            self.trend_row("13:45", 57_000, 47_000, 24_242, 24_190),
+            self.trend_row("13:30", 61_000, 37_000, 24_248, 24_188),
+            self.trend_row("13:15", 90_000, 30_000, 24_195, 24_183),
+            self.trend_row("13:00", 93_000, 23_000, 24_170, 24_183),
+        ]
+        config = load_config()
+        analyses = {
+            minutes: analyze_market_window(
+                rows,
+                strike_direction="BEARISH_BIAS",
+                config=config,
+                horizon_minutes=minutes,
+            )
+            for minutes in (15, 30, 45)
+        }
+        combined = combine_timeframe_analyses(analyses, config)
+        strikes = {
+            24_000.0: strike_row(
+                24_000,
+                call_oi=400_000,
+                put_oi=1_000_000,
+                call_ltp=10,
+                put_ltp=20,
+                call_change_oi=20_000,
+                put_change_oi=50_000,
+            ),
+            24_500.0: strike_row(
+                24_500,
+                call_oi=1_500_000,
+                put_oi=300_000,
+                call_ltp=20,
+                put_ltp=10,
+                call_change_oi=300_000,
+                put_change_oi=10_000,
+            ),
+        }
+
+        report = build_market_report(
+            snapshot_id=7,
+            captured_at="2026-07-21T13:45:00+05:30",
+            instrument="NIFTY",
+            current_rows=strikes,
+            previous_snapshot=None,
+            previous_rows={},
+            differences=[],
+            direction=combined.state,
+            confidence=combined.confidence,
+            explanations=[],
+            comparison_seconds=None,
+            comparison_status="BASELINE",
+            intraday_times=[row.time_text for row in rows],
+            intraday_signals=IntradaySignalResult(None, 0, None, 0),
+            analysis=combined,
+            timeframe_analyses=analyses,
+            intraday_trend_rows=rows,
+            config=config,
+            option_probabilities={},
+        )
+
+        self.assertIn("NIFTY EASY REPORT", report)
+        self.assertIn("Current price: 24242", report)
+        self.assertIn("15-minute view:", report)
+        self.assertIn("30-minute view:", report)
+        self.assertIn("45-minute view:", report)
+        self.assertIn("Support strike: 24000", report)
+        self.assertIn("Resistance strike: 24500", report)
+        self.assertIn("Option selling decision: WAIT", report)
+        self.assertNotIn("24.0K", report)
+        self.assertNotIn("24.5K", report)
+        self.assertNotIn("Composite score", report)
+
+        recent_report = build_recent_instrument_report(
+            instrument="NIFTY",
+            captured_at="2026-07-21T13:45:00+05:30",
+            minutes=30,
+            analysis=analyses[30],
+            current_rows=strikes,
+            intraday_trend_rows=rows,
+            image_count=3,
+            option_probabilities=[],
+            config=config,
+        )
+        self.assertIn("NIFTY — LAST 30-MINUTE EASY REPORT", recent_report)
+        self.assertIn("Stored images used: 3", recent_report)
+        self.assertIn("Data window used: 13:15 to 13:45 IST", recent_report)
+        self.assertIn("Current price: 24242", recent_report)
+        self.assertIn("Support strike: 24000", recent_report)
+        self.assertIn("Resistance strike: 24500", recent_report)
+        self.assertIn("Option selling decision: WAIT", recent_report)
+
     def test_strike_movers_and_oi_levels_are_ranked(self) -> None:
         rows = {
             100.0: strike_row(
@@ -733,6 +830,8 @@ class PredictionLogicTests(unittest.TestCase):
         self.assertIn("30-MINUTE OPTION PREMIUM PROBABILITY", report)
         self.assertIn("+------", report)
         self.assertIn("Estimated OI support and resistance:", report)
+        self.assertIn("- Primary support: 24000", report)
+        self.assertIn("- Primary resistance: 24500", report)
         self.assertIn("Strike-table confirmation:", report)
         self.assertIn("Plain-language conclusion:", report)
 
@@ -807,6 +906,8 @@ class PredictionLogicTests(unittest.TestCase):
                 market_condition TEXT,
                 entry_time TEXT,
                 strike REAL,
+                entry_ltp REAL,
+                exit_time TEXT,
                 buy_net_return_pct REAL,
                 sell_net_return_pct REAL
             )
@@ -816,6 +917,8 @@ class PredictionLogicTests(unittest.TestCase):
             (
                 "NIFTY", 15, option_type, "ATM", "BULLISH",
                 f"2026-07-{day:02d}T10:00:00+05:30", 24_200,
+                100,
+                f"2026-07-{day:02d}T10:15:00+05:30",
                 2.0 if day <= 48 else -2.0,
                 2.0 if day <= 48 else -2.0,
             )
@@ -824,7 +927,7 @@ class PredictionLogicTests(unittest.TestCase):
         ]
         connection.executemany(
             """
-            INSERT INTO option_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO option_outcomes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             history,
         )
@@ -855,24 +958,187 @@ class PredictionLogicTests(unittest.TestCase):
                 put_ltp=100,
                 call_change_oi=10,
                 put_change_oi=10,
-            )
+            ),
+            24_150.0: strike_row(
+                24_150,
+                call_oi=100,
+                put_oi=100,
+                call_ltp=120,
+                put_ltp=80,
+                call_change_oi=10,
+                put_change_oi=10,
+            ),
         }
+        config = load_config()
+        config.update({
+            "option_probability_min_samples": 50,
+            "option_probability_min_trading_days": 20,
+            "option_probability_max_tail_loss_pct": 10,
+            "option_probability_max_observed_loss_pct": 10,
+            "option_max_risk_reward_ratio": 5,
+        })
+        ema_rows = [
+            self.trend_row(
+                "10:00",
+                50_000,
+                70_000,
+                24_100 + index * 5,
+                24_080 + index * 5,
+            )
+            for index in range(21)
+        ]
 
         results = estimate_option_probabilities(
             connection,
             "NIFTY",
             current,
             analysis,
-            load_config(),
+            config,
+            intraday_trend_rows=ema_rows,
+            volume_confirmation=True,
         )
         low, high = wilson_probability_interval(48, 60)
+        selected = next(
+            result
+            for result in results
+            if result.strike == 24_200 and result.option_type == "PUT"
+        )
 
-        self.assertEqual(2, len(results))
-        self.assertTrue(all(result.sample_count == 60 for result in results))
-        self.assertTrue(all(result.win_probability == 0.8 for result in results))
+        self.assertEqual(4, len(results))
+        self.assertEqual(60, selected.sample_count)
+        self.assertEqual(0.8, selected.win_probability)
         self.assertLess(low, 0.8)
         self.assertGreater(high, 0.8)
-        self.assertTrue(all("CANDIDATE" in result.model_signal for result in results))
+        self.assertIn("SELL 24200 PUT", selected.model_signal)
+        self.assertEqual(24_150, selected.hedge_strike)
+        self.assertTrue(all(
+            status == "PASS" for status in selected.gate_statuses.values()
+        ))
+        rendered = "\n".join(option_probability_lines(results, 15, config))
+        self.assertIn("Strict gate audit: SELL 24200 PUT", rendered)
+        self.assertIn("INDEPENDENT SAMPLES", rendered)
+        self.assertIn("DEFINED-RISK HEDGE", rendered)
+        compact = "\n".join(option_probability_lines(
+            results,
+            15,
+            config,
+            gate_audit_limit=0,
+            compact=True,
+        ))
+        self.assertIn("Only the two leading directional sell rows", compact)
+        self.assertNotIn("Strict gate audit", compact)
+
+        volume_blocked = estimate_option_probabilities(
+            connection,
+            "NIFTY",
+            current,
+            analysis,
+            config,
+            intraday_trend_rows=ema_rows,
+            volume_confirmation=None,
+        )
+        selected_blocked = next(
+            result
+            for result in volume_blocked
+            if result.strike == 24_200 and result.option_type == "PUT"
+        )
+        self.assertEqual("N/A", selected_blocked.gate_statuses["VOLUME"])
+        self.assertEqual("NO TRADE", selected_blocked.model_signal)
+        connection.close()
+
+    def test_correlated_strikes_count_as_one_independent_timestamp(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE outcomes (entry_time TEXT, net_return REAL)"
+        )
+        connection.executemany(
+            "INSERT INTO outcomes VALUES (?, ?)",
+            [
+                ("2026-07-20T10:00:00+05:30", 10),
+                ("2026-07-20T10:00:00+05:30", -2),
+                ("2026-07-20T10:15:00+05:30", 4),
+            ],
+        )
+
+        returns, trading_days = grouped_independent_returns(
+            connection.execute(
+                "SELECT entry_time, net_return FROM outcomes"
+            ).fetchall()
+        )
+
+        self.assertEqual([4.0, 4.0], returns)
+        self.assertEqual(1, trading_days)
+        connection.close()
+
+    def test_option_outcome_rejects_a_late_snapshot(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            """
+            CREATE TABLE option_outcomes (
+                id INTEGER PRIMARY KEY,
+                instrument TEXT,
+                expiry TEXT,
+                strike REAL,
+                option_type TEXT,
+                target_time TEXT,
+                entry_ltp REAL,
+                exit_ltp REAL,
+                exit_time TEXT,
+                premium_return_pct REAL,
+                buy_net_return_pct REAL,
+                sell_net_return_pct REAL,
+                evaluated_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO option_outcomes (
+                id, instrument, expiry, strike, option_type,
+                target_time, entry_ltp
+            ) VALUES (1, 'NIFTY', '2026-07-23', 24200, 'CALL',
+                      '2026-07-22T10:15:00+05:30', 100)
+            """
+        )
+        current = {
+            24_200.0: strike_row(
+                24_200,
+                call_oi=100,
+                put_oi=100,
+                call_ltp=90,
+                put_ltp=110,
+                call_change_oi=10,
+                put_change_oi=10,
+            )
+        }
+        config = load_config()
+        config["option_outcome_tolerance_seconds"] = 90
+
+        late = evaluate_pending_option_outcomes(
+            connection,
+            "NIFTY",
+            "2026-07-23",
+            "2026-07-22T10:17:00+05:30",
+            current,
+            config,
+        )
+        exact = evaluate_pending_option_outcomes(
+            connection,
+            "NIFTY",
+            "2026-07-23",
+            "2026-07-22T10:16:00+05:30",
+            current,
+            config,
+        )
+
+        self.assertEqual(0, late)
+        self.assertEqual(1, exact)
+        row = connection.execute(
+            "SELECT exit_time FROM option_outcomes WHERE id = 1"
+        ).fetchone()
+        self.assertEqual("2026-07-22T10:16:00+05:30", row["exit_time"])
         connection.close()
 
     def test_expiry_is_normalized(self) -> None:

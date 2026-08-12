@@ -1,0 +1,74 @@
+<Window x:Class="TelegramStrikeMonitor.App.FirstRunSetupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Telegram Strike Monitor - First-time setup"
+        Icon="Assets/AppLogo.ico"
+        Width="620"
+        Height="590"
+        MinWidth="560"
+        MinHeight="540"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="CanResizeWithGrip">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <Grid Margin="24">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,18">
+                <Image Source="Assets/AppLogo.png" Width="72" Height="72" Margin="0,0,16,0"/>
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="First-time Telegram setup" FontSize="24" FontWeight="SemiBold"/>
+                    <TextBlock Text="Credentials stay only on this computer." Foreground="{StaticResource TextSecondary}" Margin="0,4,0,0"/>
+                </StackPanel>
+            </StackPanel>
+
+            <TextBlock Grid.Row="1" TextWrapping="Wrap" Margin="0,0,0,16"
+                       Text="Enter the API ID and API hash from my.telegram.org. The app will then open a secure one-time console where Telegram asks for your phone number, login code, and two-step password when applicable."/>
+
+            <TextBlock Grid.Row="2" Text="Telegram API ID" FontWeight="SemiBold" Margin="0,0,0,4"/>
+            <TextBox x:Name="ApiIdTextBox" Grid.Row="3" Margin="0,0,0,12"/>
+
+            <TextBlock Grid.Row="4" Text="Telegram API hash" FontWeight="SemiBold" Margin="0,0,0,4"/>
+            <PasswordBox x:Name="ApiHashPasswordBox" Grid.Row="5" Padding="8" Margin="0,0,0,12"/>
+
+            <Grid Grid.Row="6" Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="16"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel>
+                    <TextBlock Text="Source channel" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                    <TextBox x:Name="ChannelTextBox" Text="autotrendpcrr"/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                    <TextBlock Text="Report destination" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                    <TextBox x:Name="ReportTargetTextBox" Text="me"/>
+                </StackPanel>
+            </Grid>
+
+            <Border Grid.Row="7" Background="#E8EEF8" CornerRadius="6" Padding="12" Margin="0,0,0,16">
+                <TextBlock TextWrapping="Wrap"
+                           Text="Recommended: keep Report destination as 'me' to send reports to Telegram Saved Messages. The installer never contains or uploads these credentials."/>
+            </Border>
+
+            <TextBlock x:Name="SetupStatusText" Grid.Row="8" Text="Ready for setup."
+                       Foreground="{StaticResource TextSecondary}" TextWrapping="Wrap" Margin="0,0,0,14"/>
+
+            <StackPanel Grid.Row="9" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Cancel" Style="{StaticResource SecondaryButton}" Click="CancelButton_Click"/>
+                <Button x:Name="ConfigureButton" Content="Save and authorize Telegram" Click="ConfigureButton_Click"/>
+            </StackPanel>
+        </Grid>
+    </ScrollViewer>
+</Window>

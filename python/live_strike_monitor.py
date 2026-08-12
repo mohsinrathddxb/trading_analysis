@@ -96,10 +96,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "45": 0.50,
     },
     "strike_movers_rows": 15,
-    "option_probability_min_samples": 50,
+    "option_probability_min_samples": 100,
+    "option_probability_min_trading_days": 20,
     "option_probability_threshold": 0.60,
+    "option_probability_lower_bound_threshold": 0.52,
     "option_probability_round_trip_cost_pct": 0.005,
     "option_probability_min_entry_ltp": 1.0,
+    "option_candidate_min_entry_ltp": 10.0,
+    "option_candidate_min_row_confidence": 70,
+    "option_outcome_tolerance_seconds": 90,
+    "option_probability_max_tail_loss_pct": 35.0,
+    "option_probability_max_observed_loss_pct": 100.0,
+    "option_max_risk_reward_ratio": 5.0,
+    "option_ema_min_rows": 21,
+    "option_require_volume_confirmation": True,
     "option_probability_max_rows": 8,
     "option_probability_score_threshold": 0.20,
     "composite_weights": {
@@ -282,10 +292,22 @@ class OptionProbabilityResult:
     probability_low: float | None
     probability_high: float | None
     sample_count: int
+    trading_day_count: int
     average_win_pct: float | None
     average_loss_pct: float | None
     expected_value_pct: float | None
+    worst_loss_pct: float | None
+    tail_loss_pct: float | None
+    ema9: float | None
+    ema21: float | None
+    hedge_strike: float | None
+    hedge_ltp: float | None
+    spread_credit: float | None
+    maximum_loss: float | None
+    risk_reward_ratio: float | None
     data_quality: str
+    gate_statuses: dict[str, str]
+    gate_details: dict[str, str]
     reason: str
 
 
@@ -328,6 +350,13 @@ def configure_tesseract() -> None:
     if detected:
         pytesseract.pytesseract.tesseract_cmd = detected
         LOGGER.info("Tesseract: %s", detected)
+        return
+
+    bundled_path = PROJECT_DIR / "tesseract" / "tesseract.exe"
+    if bundled_path.exists():
+        pytesseract.pytesseract.tesseract_cmd = str(bundled_path)
+        os.environ.setdefault("TESSDATA_PREFIX", str(bundled_path.parent / "tessdata"))
+        LOGGER.info("Tesseract: %s", bundled_path)
         return
 
     default_path = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
@@ -455,6 +484,7 @@ def connect_database() -> sqlite3.Connection:
             analysis_confidence INTEGER NOT NULL,
             row_confidence REAL NOT NULL,
             exit_ltp REAL,
+            exit_time TEXT,
             premium_return_pct REAL,
             buy_net_return_pct REAL,
             sell_net_return_pct REAL,
@@ -465,6 +495,16 @@ def connect_database() -> sqlite3.Connection:
         )
         """
     )
+    option_outcome_columns = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(option_outcomes)"
+        ).fetchall()
+    }
+    if "exit_time" not in option_outcome_columns:
+        connection.execute(
+            "ALTER TABLE option_outcomes ADD COLUMN exit_time TEXT"
+        )
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_option_outcomes_calibration
@@ -2765,6 +2805,115 @@ def load_rows(connection: sqlite3.Connection, snapshot_id: int) -> dict[float, S
     }
 
 
+def load_intraday_rows(
+    connection: sqlite3.Connection,
+    snapshot_id: int,
+) -> list[IntradayTrendRow]:
+    """Load the OCR-validated Intraday Trend rows stored for one image."""
+
+    database_rows = connection.execute(
+        """
+        SELECT *
+        FROM intraday_rows
+        WHERE snapshot_id = ?
+        ORDER BY top_position
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    return [
+        IntradayTrendRow(
+            time_text=str(row["row_time"]),
+            call_value=float(row["call_value"]),
+            put_value=float(row["put_value"]),
+            diff_value=float(row["diff_value"]),
+            pcr=float(row["pcr"]),
+            option_signal=row["option_signal"],
+            price=row["price"],
+            vwap=row["vwap"],
+            vwap_signal=row["vwap_signal"],
+            confidence=float(row["confidence"] or 0),
+            math_valid=bool(row["math_valid"]),
+            raw_text=str(row["raw_text"] or ""),
+            top=float(row["top_position"] or 0),
+        )
+        for row in database_rows
+    ]
+
+
+def load_recent_intraday_rows_from_images(
+    connection: sqlite3.Connection,
+    instrument: str,
+    market_day: str,
+    latest_captured_at: str,
+    minutes: int,
+) -> tuple[list[IntradayTrendRow], int]:
+    """Build a clean recent series from the closest matching stored images."""
+
+    latest_datetime = parse_iso_datetime(latest_captured_at)
+    earliest_datetime = latest_datetime - timedelta(minutes=minutes + 30)
+    candidates = connection.execute(
+        """
+        SELECT ir.*, s.id AS source_snapshot_id, s.captured_at AS source_time
+        FROM intraday_rows AS ir
+        JOIN snapshots AS s ON s.id = ir.snapshot_id
+        WHERE s.instrument = ?
+          AND substr(s.captured_at, 1, 10) = ?
+          AND s.captured_at <= ?
+        ORDER BY s.id DESC, ir.top_position
+        """,
+        (instrument, market_day, latest_captured_at),
+    ).fetchall()
+
+    selected: dict[str, tuple[tuple[float, float, int], sqlite3.Row]] = {}
+    for row in candidates:
+        clock = parse_clock_word(str(row["row_time"]))
+        if clock is None:
+            continue
+        row_datetime = latest_datetime.replace(
+            hour=clock[0],
+            minute=clock[1],
+            second=clock[2],
+            microsecond=0,
+        )
+        if row_datetime < earliest_datetime or row_datetime > latest_datetime:
+            continue
+        source_datetime = parse_iso_datetime(str(row["source_time"]))
+        distance_seconds = abs(
+            (source_datetime - row_datetime).total_seconds()
+        )
+        # Prefer the image posted for this exact row time, then stronger OCR.
+        rank = (
+            distance_seconds,
+            -float(row["confidence"] or 0),
+            -int(row["source_snapshot_id"]),
+        )
+        existing = selected.get(str(row["row_time"]))
+        if existing is None or rank < existing[0]:
+            selected[str(row["row_time"])] = (rank, row)
+
+    rows: list[IntradayTrendRow] = []
+    source_snapshot_ids: set[int] = set()
+    for _, row in selected.values():
+        source_snapshot_ids.add(int(row["source_snapshot_id"]))
+        rows.append(IntradayTrendRow(
+            time_text=str(row["row_time"]),
+            call_value=float(row["call_value"]),
+            put_value=float(row["put_value"]),
+            diff_value=float(row["diff_value"]),
+            pcr=float(row["pcr"]),
+            option_signal=row["option_signal"],
+            price=row["price"],
+            vwap=row["vwap"],
+            vwap_signal=row["vwap_signal"],
+            confidence=float(row["confidence"] or 0),
+            math_valid=bool(row["math_valid"]),
+            raw_text=str(row["raw_text"] or ""),
+            top=float(row["top_position"] or 0),
+        ))
+    rows.sort(key=trend_row_seconds, reverse=True)
+    return rows, len(source_snapshot_ids)
+
+
 def inferred_strike_interval(rows: Iterable[StrikeRow]) -> float:
     strikes = sorted({row.strike for row in rows})
     intervals = [
@@ -2805,9 +2954,8 @@ def evaluate_pending_option_outcomes(
     if not instrument or not current_rows:
         return 0
     current_datetime = parse_iso_datetime(captured_at)
-    allowed_lateness = (
-        int(config.get("intraday_expected_interval_minutes", 15)) * 60
-        + 60
+    allowed_lateness = int(
+        config.get("option_outcome_tolerance_seconds", 90)
     )
     round_trip_cost = float(
         config.get("option_probability_round_trip_cost_pct", 0.005)
@@ -2826,7 +2974,7 @@ def evaluate_pending_option_outcomes(
     evaluated = 0
     for outcome in pending:
         stored_expiry = outcome["expiry"]
-        if stored_expiry and expiry and str(stored_expiry) != expiry:
+        if str(stored_expiry or "") != str(expiry or ""):
             continue
         target_datetime = parse_iso_datetime(str(outcome["target_time"]))
         elapsed_after_target = (
@@ -2853,13 +3001,14 @@ def evaluate_pending_option_outcomes(
         connection.execute(
             """
             UPDATE option_outcomes
-            SET exit_ltp = ?, premium_return_pct = ?,
+            SET exit_ltp = ?, exit_time = ?, premium_return_pct = ?,
                 buy_net_return_pct = ?, sell_net_return_pct = ?,
                 evaluated_at = ?
             WHERE id = ?
             """,
             (
                 float(exit_ltp),
+                current_datetime.isoformat(),
                 premium_return * 100,
                 buy_net_return * 100,
                 sell_net_return * 100,
@@ -2968,27 +3117,194 @@ def wilson_probability_interval(
     return max(0.0, center - margin), min(1.0, center + margin)
 
 
+def exponential_moving_average(
+    values: list[float],
+    period: int,
+) -> float | None:
+    """Return an EMA seeded by the period's simple moving average."""
+
+    if period <= 0 or len(values) < period:
+        return None
+    current = statistics.mean(values[:period])
+    multiplier = 2 / (period + 1)
+    for value in values[period:]:
+        current = value * multiplier + current * (1 - multiplier)
+    return current
+
+
+def ema_vwap_sell_confirmation(
+    intraday_rows: list[IntradayTrendRow],
+    option_type: str,
+    minimum_rows: int,
+) -> tuple[bool | None, float | None, float | None, str]:
+    """Confirm a bearish Call sell or bullish Put sell with price/VWAP/EMAs."""
+
+    reliable = [
+        row
+        for row in intraday_rows
+        if row.math_valid
+        and row.price is not None
+        and row.price > 0
+    ]
+    reliable.sort(key=trend_row_seconds)
+    prices = [float(row.price) for row in reliable]
+    required_rows = max(21, minimum_rows)
+    if len(prices) < required_rows:
+        return (
+            None,
+            None,
+            None,
+            f"EMA unavailable: {len(prices)}/{required_rows} price rows.",
+        )
+    latest = reliable[-1]
+    if latest.vwap is None or latest.vwap <= 0:
+        return None, None, None, "VWAP unavailable in the latest row."
+    ema9 = exponential_moving_average(prices, 9)
+    ema21 = exponential_moving_average(prices, 21)
+    if ema9 is None or ema21 is None:
+        return None, ema9, ema21, "EMA calculation was unavailable."
+
+    price = float(latest.price)
+    vwap = float(latest.vwap)
+    if option_type == "CALL":
+        confirmed = price < vwap and ema9 < ema21
+        requirement = "Price<VWAP and EMA9<EMA21"
+    else:
+        confirmed = price > vwap and ema9 > ema21
+        requirement = "Price>VWAP and EMA9>EMA21"
+    return (
+        confirmed,
+        ema9,
+        ema21,
+        (
+            f"{requirement}; price={price:.2f}, VWAP={vwap:.2f}, "
+            f"EMA9={ema9:.2f}, EMA21={ema21:.2f}."
+        ),
+    )
+
+
+def defined_risk_hedge(
+    current_rows: dict[float, StrikeRow],
+    short_row: StrikeRow,
+    option_type: str,
+    minimum_confidence: float,
+) -> tuple[StrikeRow | None, float | None, float | None, float | None]:
+    """Find the nearest usable long leg for a vertical credit spread."""
+
+    short_ltp = (
+        short_row.call_ltp if option_type == "CALL" else short_row.put_ltp
+    )
+    if short_ltp is None or short_ltp <= 0:
+        return None, None, None, None
+    if option_type == "CALL":
+        candidates = sorted(
+            (
+                row for row in current_rows.values()
+                if row.strike > short_row.strike
+                and row.call_ltp is not None
+                and row.call_ltp > 0
+                and row.confidence >= minimum_confidence
+            ),
+            key=lambda row: row.strike,
+        )
+        premium_field = "call_ltp"
+    else:
+        candidates = sorted(
+            (
+                row for row in current_rows.values()
+                if row.strike < short_row.strike
+                and row.put_ltp is not None
+                and row.put_ltp > 0
+                and row.confidence >= minimum_confidence
+            ),
+            key=lambda row: row.strike,
+            reverse=True,
+        )
+        premium_field = "put_ltp"
+
+    for hedge in candidates:
+        hedge_ltp = float(getattr(hedge, premium_field))
+        credit = float(short_ltp) - hedge_ltp
+        width = abs(hedge.strike - short_row.strike)
+        if credit <= 0 or width <= credit:
+            continue
+        maximum_loss = width - credit
+        risk_reward_ratio = maximum_loss / credit
+        return hedge, credit, maximum_loss, risk_reward_ratio
+    return None, None, None, None
+
+
+def grouped_independent_returns(
+    rows: Iterable[sqlite3.Row],
+) -> tuple[list[float], int]:
+    """Collapse correlated same-timestamp strikes into one median observation."""
+
+    values_by_time: dict[str, list[float]] = {}
+    trading_days: set[str] = set()
+    for row in rows:
+        entry_time = str(row["entry_time"])
+        value = row["net_return"]
+        if value is None:
+            continue
+        values_by_time.setdefault(entry_time, []).append(float(value))
+        try:
+            trading_days.add(parse_iso_datetime(entry_time).date().isoformat())
+        except (TypeError, ValueError):
+            pass
+    independent_returns = [
+        statistics.median(values_by_time[entry_time])
+        for entry_time in sorted(values_by_time)
+    ]
+    return independent_returns, len(trading_days)
+
+
 def estimate_option_probabilities(
     connection: sqlite3.Connection,
     instrument: str | None,
     current_rows: dict[float, StrikeRow],
     analysis: MarketAnalysis,
     config: dict[str, Any],
+    intraday_trend_rows: list[IntradayTrendRow] | None = None,
+    volume_confirmation: bool | None = None,
 ) -> list[OptionProbabilityResult]:
-    """Estimate empirical option-premium win rates from prior evaluated rows."""
+    """Estimate independent outcomes and enforce every strict sell gate."""
 
     if not instrument or analysis.current_price is None or not current_rows:
         return []
-    minimum_samples = int(config.get("option_probability_min_samples", 50))
+    minimum_samples = int(config.get("option_probability_min_samples", 100))
+    minimum_days = int(config.get("option_probability_min_trading_days", 20))
     probability_threshold = float(
         config.get("option_probability_threshold", 0.60)
+    )
+    lower_bound_threshold = float(
+        config.get("option_probability_lower_bound_threshold", 0.52)
     )
     score_threshold = float(
         config.get("option_probability_score_threshold", 0.20)
     )
+    minimum_candidate_ltp = float(
+        config.get("option_candidate_min_entry_ltp", 10.0)
+    )
+    minimum_row_confidence = float(
+        config.get("option_candidate_min_row_confidence", 70)
+    )
+    maximum_tail_loss = float(
+        config.get("option_probability_max_tail_loss_pct", 35.0)
+    )
+    maximum_observed_loss = float(
+        config.get("option_probability_max_observed_loss_pct", 100.0)
+    )
+    maximum_risk_reward = float(
+        config.get("option_max_risk_reward_ratio", 5.0)
+    )
+    require_volume = bool(
+        config.get("option_require_volume_confirmation", True)
+    )
+    ema_minimum_rows = int(config.get("option_ema_min_rows", 21))
     maximum_rows = int(config.get("option_probability_max_rows", 8))
     interval = inferred_strike_interval(current_rows.values())
     results: list[OptionProbabilityResult] = []
+    trend_rows = intraday_trend_rows or []
 
     for row in current_rows.values():
         for option_type, entry_ltp in (
@@ -2997,12 +3313,11 @@ def estimate_option_probabilities(
         ):
             if entry_ltp is None or entry_ltp <= 0:
                 continue
-            if abs(analysis.score) < score_threshold:
-                action = "NO TRADE"
-            elif option_type == "CALL":
-                action = "BUY" if analysis.score > 0 else "SELL"
-            else:
-                action = "BUY" if analysis.score < 0 else "SELL"
+            action = "NO TRADE"
+            if analysis.score <= -score_threshold and option_type == "CALL":
+                action = "SELL"
+            elif analysis.score >= score_threshold and option_type == "PUT":
+                action = "SELL"
 
             moneyness = option_moneyness_bucket(
                 row.strike,
@@ -3010,25 +3325,22 @@ def estimate_option_probabilities(
                 option_type,
                 interval,
             )
-            return_column = (
-                "buy_net_return_pct" if action == "BUY"
-                else "sell_net_return_pct"
-            )
+            return_column = "sell_net_return_pct"
             historical_returns: list[float] = []
+            trading_day_count = 0
             if action != "NO TRADE" and analysis.current_condition != "UNKNOWN":
-                historical_returns = [
-                    float(history[0])
-                    for history in connection.execute(
+                historical_rows = connection.execute(
                         f"""
-                        SELECT AVG({return_column})
+                        SELECT entry_time, {return_column} AS net_return
                         FROM option_outcomes
                         WHERE instrument = ?
                           AND horizon_minutes = ?
                           AND option_type = ?
                           AND moneyness = ?
                           AND market_condition = ?
+                          AND entry_ltp >= ?
+                          AND exit_time IS NOT NULL
                           AND {return_column} IS NOT NULL
-                        GROUP BY entry_time, strike
                         ORDER BY entry_time, strike
                         """,
                         (
@@ -3037,9 +3349,12 @@ def estimate_option_probabilities(
                             option_type,
                             moneyness,
                             analysis.current_condition,
+                            minimum_candidate_ltp,
                         ),
                     ).fetchall()
-                ]
+                historical_returns, trading_day_count = (
+                    grouped_independent_returns(historical_rows)
+                )
             sample_count = len(historical_returns)
             winning_returns = [value for value in historical_returns if value > 0]
             losing_returns = [value for value in historical_returns if value <= 0]
@@ -3064,52 +3379,188 @@ def estimate_option_probabilities(
             average_loss = (
                 statistics.mean(losing_returns) if losing_returns else None
             )
+            worst_loss = min(historical_returns) if historical_returns else None
+            tail_count = max(1, math.ceil(sample_count * 0.05))
+            tail_loss = (
+                statistics.mean(sorted(historical_returns)[:tail_count])
+                if historical_returns
+                else None
+            )
             data_quality_label = (
                 "High" if row.confidence >= 85
                 else "Medium" if row.confidence >= 65
                 else "Low"
             )
 
-            direction_aligned = (
-                (analysis.predicted_label == "UP" and (
-                    (option_type == "CALL" and action == "BUY")
-                    or (option_type == "PUT" and action == "SELL")
-                ))
-                or (analysis.predicted_label == "DOWN" and (
-                    (option_type == "PUT" and action == "BUY")
-                    or (option_type == "CALL" and action == "SELL")
-                ))
+            direction_aligned = action == "SELL" and (
+                (option_type == "CALL" and analysis.predicted_label == "DOWN")
+                or (option_type == "PUT" and analysis.predicted_label == "UP")
             )
-            if action == "NO TRADE":
-                model_signal = "NO TRADE"
-                reason = "Composite score does not have a directional edge."
-            elif sample_count < minimum_samples:
-                model_signal = "NO TRADE"
-                reason = (
-                    f"INSUFFICIENT DATA: {sample_count}/{minimum_samples} "
-                    "matching outcomes."
+            ema_confirmed, ema9, ema21, ema_detail = (
+                ema_vwap_sell_confirmation(
+                    trend_rows,
+                    option_type,
+                    ema_minimum_rows,
                 )
-            elif not direction_aligned:
-                model_signal = "NO TRADE"
-                reason = "The timeframe forecast does not confirm this action."
-            elif data_quality_label == "Low":
-                model_signal = "NO TRADE"
-                reason = "Strike OCR quality is low."
-            elif (
+                if action == "SELL"
+                else (None, None, None, "Not the directional sell side.")
+            )
+            oi_change = (
+                row.call_change_oi
+                if option_type == "CALL"
+                else row.put_change_oi
+            )
+            total_oi = row.call_oi if option_type == "CALL" else row.put_oi
+            oi_confirmed = (
+                action == "SELL"
+                and oi_change is not None
+                and oi_change > 0
+                and total_oi is not None
+                and total_oi > 0
+            )
+            premium_confirmed = (
+                action == "SELL"
+                and entry_ltp >= minimum_candidate_ltp
+                and row.confidence >= minimum_row_confidence
+                and total_oi is not None
+                and total_oi > 0
+                and moneyness in {"ATM", "OTM"}
+            )
+            hedge, spread_credit, maximum_loss, risk_reward_ratio = (
+                defined_risk_hedge(
+                    current_rows,
+                    row,
+                    option_type,
+                    minimum_row_confidence,
+                )
+                if action == "SELL"
+                else (None, None, None, None)
+            )
+            hedge_ltp = None
+            if hedge is not None:
+                hedge_ltp = (
+                    hedge.call_ltp
+                    if option_type == "CALL"
+                    else hedge.put_ltp
+                )
+            historical_risk_ok = (
+                worst_loss is not None
+                and tail_loss is not None
+                and worst_loss >= -maximum_observed_loss
+                and tail_loss >= -maximum_tail_loss
+            )
+            spread_risk_ok = (
+                risk_reward_ratio is not None
+                and risk_reward_ratio <= maximum_risk_reward
+            )
+
+            def gate_status(value: bool | None) -> str:
+                if value is None:
+                    return "N/A"
+                return "PASS" if value else "FAIL"
+
+            sample_ok = (
+                sample_count >= minimum_samples
+                and trading_day_count >= minimum_days
+            )
+            probability_ok = (
                 probability is not None
                 and probability >= probability_threshold
-                and expected_value is not None
-                and expected_value > 0
-            ):
+            )
+            lower_bound_ok = (
+                low is not None and low >= lower_bound_threshold
+            )
+            expected_value_ok = (
+                expected_value is not None and expected_value > 0
+            )
+            if require_volume:
+                volume_ok: bool | None = volume_confirmation
+            else:
+                volume_ok = True
+
+            gate_statuses = {
+                "FORECAST": gate_status(direction_aligned),
+                "INDEPENDENT SAMPLES": gate_status(sample_ok),
+                "PROBABILITY": gate_status(probability_ok),
+                "LOWER CONFIDENCE": gate_status(lower_bound_ok),
+                "EXPECTED VALUE": gate_status(expected_value_ok),
+                "WORST-CASE RISK": gate_status(
+                    historical_risk_ok and spread_risk_ok
+                ),
+                "VWAP + EMA": gate_status(ema_confirmed),
+                "VOLUME": gate_status(volume_ok),
+                "OI SUPPORT": gate_status(oi_confirmed),
+                "PREMIUM + LIQUIDITY": gate_status(premium_confirmed),
+                "DEFINED-RISK HEDGE": gate_status(hedge is not None),
+            }
+            gate_details = {
+                "FORECAST": (
+                    f"Forecast={analysis.predicted_label}; required "
+                    f"{'DOWN' if option_type == 'CALL' else 'UP'}."
+                ),
+                "INDEPENDENT SAMPLES": (
+                    f"{sample_count}/{minimum_samples} timestamps; "
+                    f"{trading_day_count}/{minimum_days} trading days."
+                ),
+                "PROBABILITY": (
+                    f"{100 * probability:.1f}% vs {100 * probability_threshold:.1f}%."
+                    if probability is not None else "Probability unavailable."
+                ),
+                "LOWER CONFIDENCE": (
+                    f"{100 * low:.1f}% vs {100 * lower_bound_threshold:.1f}%."
+                    if low is not None else "Lower confidence bound unavailable."
+                ),
+                "EXPECTED VALUE": (
+                    f"{expected_value:+.2f}% after costs."
+                    if expected_value is not None else "Expected value unavailable."
+                ),
+                "WORST-CASE RISK": (
+                    f"Worst={format_decimal(worst_loss)}%; tail5="
+                    f"{format_decimal(tail_loss)}%; spread R:R="
+                    f"{format_decimal(risk_reward_ratio)}."
+                ),
+                "VWAP + EMA": ema_detail,
+                "VOLUME": (
+                    "Verified traded volume confirmed."
+                    if volume_confirmation is True
+                    else "Verified traded volume did not confirm."
+                    if volume_confirmation is False
+                    else "Verified traded volume is unavailable."
+                ),
+                "OI SUPPORT": (
+                    f"Selected-side ChgOI={format_number(oi_change)}; "
+                    f"OI={format_number(total_oi)}."
+                ),
+                "PREMIUM + LIQUIDITY": (
+                    f"LTP={entry_ltp:.2f} (minimum {minimum_candidate_ltp:.2f}); "
+                    f"OCR={row.confidence:.0f}%; moneyness={moneyness}."
+                ),
+                "DEFINED-RISK HEDGE": (
+                    f"Buy {hedge.strike:g} {option_type}; credit="
+                    f"{format_decimal(spread_credit)}; max loss="
+                    f"{format_decimal(maximum_loss)}."
+                    if hedge is not None
+                    else "No usable farther OTM long leg was available."
+                ),
+            }
+            failed_gates = [
+                name
+                for name, status in gate_statuses.items()
+                if status != "PASS"
+            ]
+            all_gates_passed = action == "SELL" and not failed_gates
+            if all_gates_passed and hedge is not None:
                 model_signal = (
-                    f"BUY {option_type} CANDIDATE"
-                    if action == "BUY"
-                    else f"SELL {option_type} CANDIDATE (HEDGE REQUIRED)"
+                    f"SELL {row.strike:g} {option_type}; "
+                    f"BUY {hedge.strike:g} {option_type} HEDGE"
                 )
-                reason = "Calibrated probability and expected value passed thresholds."
+                reason = "All strict probability and risk gates passed."
+            elif action == "NO TRADE":
+                model_signal = "NO TRADE"
+                reason = "This is not the directional option-selling side."
             else:
                 model_signal = "NO TRADE"
-                reason = "Historical probability or expected value has no verified edge."
+                reason = "Failed gates: " + ", ".join(failed_gates) + "."
 
             results.append(OptionProbabilityResult(
                 horizon_minutes=analysis.horizon_minutes,
@@ -3123,10 +3574,22 @@ def estimate_option_probabilities(
                 probability_low=low,
                 probability_high=high,
                 sample_count=sample_count,
+                trading_day_count=trading_day_count,
                 average_win_pct=average_win,
                 average_loss_pct=average_loss,
                 expected_value_pct=expected_value,
+                worst_loss_pct=worst_loss,
+                tail_loss_pct=tail_loss,
+                ema9=ema9,
+                ema21=ema21,
+                hedge_strike=hedge.strike if hedge is not None else None,
+                hedge_ltp=float(hedge_ltp) if hedge_ltp is not None else None,
+                spread_credit=spread_credit,
+                maximum_loss=maximum_loss,
+                risk_reward_ratio=risk_reward_ratio,
                 data_quality=data_quality_label,
+                gate_statuses=gate_statuses,
+                gate_details=gate_details,
                 reason=reason,
             ))
 
@@ -3147,7 +3610,7 @@ def write_option_backtest_report(connection: sqlite3.Connection) -> None:
         SELECT instrument, expiry, strike, option_type, horizon_minutes,
                entry_time, target_time, entry_ltp, spot_price, moneyness,
                market_condition, predicted_label, analysis_score,
-               analysis_confidence, row_confidence, exit_ltp,
+               analysis_confidence, row_confidence, exit_ltp, exit_time,
                premium_return_pct, buy_net_return_pct,
                sell_net_return_pct, evaluated_at
         FROM option_outcomes
@@ -3694,6 +4157,16 @@ def format_number(value: float | None) -> str:
     if float(value).is_integer():
         return f"{value:.0f}"
     return f"{value:.2f}"
+
+
+def format_exact_number(value: float | None) -> str:
+    """Render a price or strike without K/L/Cr abbreviation or rounding."""
+
+    if value is None:
+        return "n/a"
+    if float(value).is_integer():
+        return f"{value:.0f}"
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def format_decimal(value: float | None, digits: int = 2) -> str:
@@ -4383,10 +4856,13 @@ def option_probability_lines(
     results: list[OptionProbabilityResult],
     horizon_minutes: int,
     config: dict[str, Any],
+    gate_audit_limit: int | None = None,
+    compact: bool = False,
 ) -> list[str]:
     """Render calibrated premium-P&L results without presenting certainty."""
 
-    minimum_samples = int(config.get("option_probability_min_samples", 50))
+    minimum_samples = int(config.get("option_probability_min_samples", 100))
+    minimum_days = int(config.get("option_probability_min_trading_days", 20))
     cost_pct = 100 * float(
         config.get("option_probability_round_trip_cost_pct", 0.005)
     )
@@ -4396,13 +4872,80 @@ def option_probability_lines(
         (
             "Win means net premium P&L > 0 after an assumed "
             f"{cost_pct:.2f}% round-trip cost. Probability is shown only at "
-            f"N >= {minimum_samples}; it is not a guarantee."
+            f"N >= {minimum_samples} independent timestamps across at least "
+            f"{minimum_days} trading days; it is not a guarantee."
         ),
     ]
+    if compact:
+        sell_results = [
+            result
+            for result in results
+            if result.evaluated_action == "SELL"
+        ][:2]
+        compact_rows: list[list[Any]] = []
+        for result in sell_results:
+            enough_samples = (
+                result.sample_count >= minimum_samples
+                and result.trading_day_count >= minimum_days
+            )
+            probability_text = (
+                f"{100 * result.win_probability:.1f}% / "
+                f"{100 * result.probability_low:.1f}%"
+                if enough_samples
+                and result.win_probability is not None
+                and result.probability_low is not None
+                else "n/a"
+            )
+            failed = [
+                gate
+                for gate, status in result.gate_statuses.items()
+                if status != "PASS"
+            ]
+            compact_rows.append([
+                f"{result.strike:g}",
+                result.option_type,
+                format_decimal(result.entry_ltp),
+                f"{result.sample_count}/{result.trading_day_count}",
+                probability_text,
+                (
+                    f"{result.expected_value_pct:+.2f}%"
+                    if enough_samples
+                    and result.expected_value_pct is not None
+                    else "n/a"
+                ),
+                (
+                    f"{result.hedge_strike:g}"
+                    if result.hedge_strike is not None
+                    else "n/a"
+                ),
+                result.model_signal,
+                ", ".join(failed) if failed else "none",
+            ])
+        if not compact_rows:
+            compact_rows = [["n/a"] * 9]
+        lines.extend(render_ascii_table(
+            [
+                "Strike", "Type", "LTP", "N/Days", "Win/Low", "EV",
+                "Hedge", "Signal", "Failed gates",
+            ],
+            compact_rows,
+            [8, 4, 8, 8, 14, 9, 8, 22, 52],
+        ))
+        lines.extend([
+            "Only the two leading directional sell rows are shown here. Full "
+            "probability evidence and every gate are in the individual "
+            f"{horizon_minutes}-minute TXT report.",
+            "A signal requires every gate to pass and a defined-risk hedge.",
+        ])
+        return lines
+
     numeric_rows: list[list[Any]] = []
     reason_rows: list[list[Any]] = []
     for result in results:
-        enough_samples = result.sample_count >= minimum_samples
+        enough_samples = (
+            result.sample_count >= minimum_samples
+            and result.trading_day_count >= minimum_days
+        )
         probability = (
             f"{100 * result.win_probability:.1f}%"
             if enough_samples and result.win_probability is not None
@@ -4425,6 +4968,7 @@ def option_probability_lines(
             probability,
             probability_range,
             result.sample_count,
+            result.trading_day_count,
             (
                 f"{result.expected_value_pct:+.2f}%"
                 if enough_samples and result.expected_value_pct is not None
@@ -4449,27 +4993,80 @@ def option_probability_lines(
             result.reason,
         ])
     if not numeric_rows:
-        numeric_rows = [["n/a"] * 10]
+        numeric_rows = [["n/a"] * 11]
     lines.extend(render_ascii_table(
         [
             "Strike", "Type", "LTP", "Mny", "Tested", "Win %",
-            "95% range", "N", "EV", "Model signal",
+            "95% range", "N", "Days", "EV", "Model signal",
         ],
         numeric_rows,
-        [8, 4, 8, 4, 8, 7, 15, 5, 9, 34],
+        [8, 4, 8, 4, 8, 7, 15, 5, 5, 9, 38],
     ))
     if reason_rows:
         lines.extend(["", "Probability evidence and filters:"])
         lines.extend(render_ascii_table(
             [
-                "Strike", "Type", "Avg win", "Avg loss", "OCR", "Reason",
+                "Strike", "Type", "Avg win", "Avg loss", "Worst", "Tail5",
+                "OCR", "Reason",
             ],
-            reason_rows,
-            [8, 4, 9, 9, 6, 66],
+            [
+                [
+                    *row[:4],
+                    (
+                        f"{result.worst_loss_pct:+.2f}%"
+                        if result.worst_loss_pct is not None else "n/a"
+                    ),
+                    (
+                        f"{result.tail_loss_pct:+.2f}%"
+                        if result.tail_loss_pct is not None else "n/a"
+                    ),
+                    *row[4:],
+                ]
+                for row, result in zip(reason_rows, results)
+            ],
+            [8, 4, 9, 9, 9, 9, 6, 66],
         ))
+    sell_results = [
+        result for result in results if result.evaluated_action == "SELL"
+    ]
+    total_sell_results = len(sell_results)
+    if gate_audit_limit is not None:
+        sell_results = sell_results[:max(0, gate_audit_limit)]
+    for result in sell_results:
+        hedge_text = (
+            f"BUY {result.hedge_strike:g} {result.option_type} @ "
+            f"{result.hedge_ltp:.2f}"
+            if result.hedge_strike is not None
+            and result.hedge_ltp is not None
+            else "n/a"
+        )
+        lines.extend([
+            "",
+            (
+                f"Strict gate audit: SELL {result.strike:g} "
+                f"{result.option_type}; hedge={hedge_text}"
+            ),
+        ])
+        lines.extend(render_ascii_table(
+            ["Gate", "Status", "Evidence"],
+            [
+                [
+                    gate,
+                    status,
+                    result.gate_details.get(gate, "n/a"),
+                ]
+                for gate, status in result.gate_statuses.items()
+            ],
+            [23, 6, 78],
+        ))
+    if total_sell_results and not sell_results:
+        lines.append(
+            "Full per-strike gate audits are stored in the individual "
+            f"{horizon_minutes}-minute TXT report."
+        )
     lines.extend([
-        "Buy candidates risk the premium paid. Sell candidates require a "
-        "defined-risk hedge; naked option selling is not recommended.",
+        "A sell signal is issued only when every displayed gate passes and a "
+        "defined-risk hedge is available; naked option selling is rejected.",
         "Model output is statistical research, not personalized financial advice.",
     ])
     return lines
@@ -4932,8 +5529,8 @@ def build_timeframe_report(
                 f"Put={format_number(row.put_value)}, "
                 f"Diff={format_number(row.diff_value)}, "
                 f"PCR={row.pcr:.3f}, "
-                f"Price={format_number(row.price)}, "
-                f"VWAP={format_number(row.vwap)}, "
+                f"Price={format_exact_number(row.price)}, "
+                f"VWAP={format_exact_number(row.vwap)}, "
                 f"Option={row.option_signal or 'n/a'}, "
                 f"VWAP signal={row.vwap_signal or 'n/a'}, "
                 f"OCR={row.confidence:.0f}%"
@@ -4963,8 +5560,8 @@ def build_timeframe_report(
         f"- Average Put: {format_number(analysis.average_put)}",
         f"- Average Diff: {format_number(analysis.average_diff)}",
         f"- Average PCR: {format_number(analysis.average_pcr)}",
-        f"- Average Price: {format_number(analysis.average_price)}",
-        f"- Average VWAP: {format_number(analysis.average_vwap)}",
+        f"- Average Price: {format_exact_number(analysis.average_price)}",
+        f"- Average VWAP: {format_exact_number(analysis.average_vwap)}",
         (
             f"- Average normalized imbalance: {analysis.imbalance:+.3f}"
             if analysis.imbalance is not None
@@ -4984,8 +5581,8 @@ def build_timeframe_report(
             else "- Latest normalized imbalance: n/a"
         ),
         (
-            f"- Latest Price / VWAP: {format_number(latest_row.price)} / "
-            f"{format_number(latest_row.vwap)}"
+            f"- Latest Price / VWAP: {format_exact_number(latest_row.price)} / "
+            f"{format_exact_number(latest_row.vwap)}"
             if latest_row is not None
             else "- Latest Price / VWAP: n/a / n/a"
         ),
@@ -5058,12 +5655,12 @@ def build_timeframe_report(
     lines.extend([
         "",
         "Estimated OI support and resistance:",
-        f"- Primary support: {format_number(levels.primary_support)}",
-        f"- Developing support: {format_number(levels.developing_support)}",
-        f"- Weakening support: {format_number(levels.weakening_support)}",
-        f"- Primary resistance: {format_number(levels.primary_resistance)}",
-        f"- Developing resistance: {format_number(levels.developing_resistance)}",
-        f"- Weakening resistance: {format_number(levels.weakening_resistance)}",
+        f"- Primary support: {format_exact_number(levels.primary_support)}",
+        f"- Developing support: {format_exact_number(levels.developing_support)}",
+        f"- Weakening support: {format_exact_number(levels.weakening_support)}",
+        f"- Primary resistance: {format_exact_number(levels.primary_resistance)}",
+        f"- Developing resistance: {format_exact_number(levels.developing_resistance)}",
+        f"- Weakening resistance: {format_exact_number(levels.weakening_resistance)}",
         f"- Level confidence: {confidence_label(levels.confidence)} "
         f"({levels.confidence}%)",
         "- These are OI-derived estimates, not guaranteed turning points.",
@@ -5072,7 +5669,8 @@ def build_timeframe_report(
         f"- Bullish / bearish / mixed rows: "
         f"{bullish_rows} / {bearish_rows} / {mixed_rows}",
         f"- OI support / resistance: "
-        f"{format_number(current_support)} / {format_number(current_resistance)}",
+        f"{format_exact_number(current_support)} / "
+        f"{format_exact_number(current_resistance)}",
         f"- Strikes read: {len(current_rows)}",
         f"- Data quality: {quality} (OCR {average_ocr_confidence}%)",
     ])
@@ -5127,245 +5725,423 @@ def build_market_report(
     strike_comparisons: dict[int, TimeframeStrikeComparison] | None = None,
     option_probabilities: dict[int, list[OptionProbabilityResult]] | None = None,
 ) -> str:
-    """Render current condition, momentum, and forecast as separate concepts."""
+    """Render a short easy-reading report for the dashboard and Telegram."""
 
-    del snapshot_id, previous_rows, intraday_signals
+    del (
+        snapshot_id,
+        previous_snapshot,
+        previous_rows,
+        differences,
+        explanations,
+        comparison_seconds,
+        intraday_times,
+        intraday_signals,
+        strike_comparisons,
+    )
     quality, average_ocr_confidence = data_quality(
         current_rows,
         float(config["minimum_summary_row_confidence"]),
     )
-    title, icon = direction_title(direction)
-    current_support = max_oi_strike(current_rows.values(), "put_oi")
-    current_resistance = max_oi_strike(current_rows.values(), "call_oi")
-    strike_mover_limit = int(config.get("strike_movers_rows", 15))
-    strike_comparisons = strike_comparisons or {}
-    option_probabilities = option_probabilities or {}
     levels = estimate_support_resistance(
         current_rows.values(),
         analysis.current_price,
     )
+    latest_row = intraday_trend_rows[0] if intraday_trend_rows else None
+
+    def easy_direction(value: str) -> str:
+        labels = {
+            "BULLISH": "UP",
+            "BEARISH": "DOWN",
+            "BALANCED": "SIDEWAYS",
+            "UP": "UP",
+            "DOWN": "DOWN",
+            "FLAT": "SIDEWAYS",
+        }
+        return labels.get(value.upper(), "WAITING FOR DATA")
 
     lines = [
-        f"{instrument or 'MARKET'} MULTI-TIMEFRAME ANALYSIS",
-        f"Latest table time: {format_snapshot_clock(captured_at, config)}",
+        f"{instrument or 'MARKET'} EASY REPORT — "
+        f"{format_snapshot_clock(captured_at, config)}",
+        "",
+        f"Current price: {format_exact_number(analysis.current_price)}",
+        (
+            f"VWAP: {format_exact_number(latest_row.vwap)}"
+            if latest_row is not None
+            else "VWAP: n/a"
+        ),
+        f"Market direction: {easy_direction(analysis.current_condition)}",
+        "",
     ]
-    if analysis.window_times and analysis.state != "UNCONFIRMED":
-        lines.append(
-            "Analysis window: "
-            f"{analysis.window_times[0]} to {analysis.window_times[-1]} "
-            f"({analysis.horizon_minutes} minutes)"
-        )
-    else:
-        lines.extend(intraday_window_summary(intraday_times, config)[:1])
 
-    lines.extend(["", "45m / 30m / 15m views:"])
-    for minutes, timeframe in sorted(
-        timeframe_analyses.items(),
-        reverse=True,
-    ):
-        if timeframe.state == "UNCONFIRMED":
+    for minutes in (15, 30, 45):
+        timeframe = timeframe_analyses.get(minutes)
+        if timeframe is None or timeframe.state == "UNCONFIRMED":
             lines.append(
-                f"- {minutes}m: UNCONFIRMED (complete window unavailable)"
+                f"{minutes}-minute view: WAITING FOR MORE DATA"
             )
-            continue
-        lines.append(
-            f"- {minutes}m: {timeframe.current_condition}; "
-            f"momentum={timeframe.momentum}; "
-            f"forecast={timeframe.predicted_label}; "
-            f"score={timeframe.score:+.3f}; "
-            f"confidence={timeframe.confidence}%"
-        )
-        lines.append(
-            f"  Avg Call/Put={format_number(timeframe.average_call)}/"
-            f"{format_number(timeframe.average_put)}, "
-            f"Diff={format_number(timeframe.average_diff)}, "
-            f"PCR={format_number(timeframe.average_pcr)}"
-        )
+        else:
+            lines.append(
+                f"{minutes}-minute view: "
+                f"{easy_direction(timeframe.predicted_label)} "
+                f"(confidence {timeframe.confidence}%)"
+            )
 
     lines.extend([
         "",
-        f"Combined state: {icon} {title}",
-        f"Combined average condition: {analysis.current_condition}",
-        f"Latest row condition: {analysis.latest_condition}",
-        f"Combined flow momentum: {analysis.momentum}",
-    ])
-    if direction == "UNCONFIRMED":
-        lines.append("Next 45-minute forecast: NOT ISSUED")
-    else:
-        lines.append(
-            f"Next {analysis.horizon_minutes}-minute forecast: "
-            f"{analysis.predicted_label}"
-        )
-    lines.extend([
-        f"Composite score: {analysis.score:+.3f} "
-        "(-1 is down, +1 is up)",
-        f"Confidence: {confidence_label(confidence)} ({confidence}%)",
+        f"Support strike: {format_exact_number(levels.primary_support)}",
+        f"Resistance strike: {format_exact_number(levels.primary_resistance)}",
+        "",
     ])
 
+    probability_results = option_probabilities or {}
+    ready_setups = sorted(
+        (
+            (minutes, result)
+            for minutes, results in probability_results.items()
+            for result in results
+            if result.model_signal != "NO TRADE"
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    if ready_setups:
+        minutes, setup = ready_setups[0]
+        lines.extend([
+            f"Option selling decision: YES — {minutes}-MINUTE SETUP",
+            f"Sell strike: {format_exact_number(setup.strike)} "
+            f"{setup.option_type}",
+            f"Hedge strike: {format_exact_number(setup.hedge_strike)} "
+            f"{setup.option_type}",
+            "Use the defined-risk hedge; do not sell the option naked.",
+        ])
+    else:
+        lines.extend([
+            "Option selling decision: WAIT",
+            "No option-selling setup passed every safety check.",
+        ])
+
+    reason_lines: list[str] = []
+    if latest_row is not None and latest_row.price is not None:
+        if latest_row.vwap is None:
+            reason_lines.append("VWAP could not be read reliably.")
+        elif latest_row.price < latest_row.vwap:
+            reason_lines.append("Price is below VWAP.")
+        elif latest_row.price > latest_row.vwap:
+            reason_lines.append("Price is above VWAP.")
+        else:
+            reason_lines.append("Price is at VWAP.")
+
+    state_reasons = {
+        "BEARISH_STRENGTHENING": "Downward pressure is strengthening.",
+        "BEARISH_WEAKENING": "Downward pressure is weakening.",
+        "BULLISH_STRENGTHENING": "Upward pressure is strengthening.",
+        "BULLISH_WEAKENING": "Upward pressure is weakening.",
+        "REVERSAL_WATCH": "A possible reversal is developing but is not confirmed.",
+        "NEUTRAL_TRANSITION": "The market does not have a stable direction yet.",
+        "UNCONFIRMED": "More clean 15-minute rows are needed.",
+    }
+    reason_lines.append(
+        state_reasons.get(
+            direction,
+            "Wait for the next confirmed update before making a decision.",
+        )
+    )
+    if not ready_setups:
+        reason_lines.append(
+            "Do not sell options until every safety check passes."
+        )
+
+    lines.extend(["", "Reason:", *reason_lines])
     if comparison_status == "STALE":
         lines.extend([
             "",
-            "No fresh Intraday Trend time was detected.",
-            "No new prediction was stored from this repeated market time.",
-            "",
-            f"Strikes read: {len(current_rows)}",
-            f"Data quality: {quality} (OCR {average_ocr_confidence}%)",
+            "Data warning: No fresh market time was detected.",
         ])
-
-    if intraday_trend_rows:
-        latest = intraday_trend_rows[0]
-        pcr_change_text = (
-            f" (change {analysis.pcr_change:+.3f})"
-            if analysis.pcr_change is not None
-            else ""
-        )
+    if instrument is None:
         lines.extend([
             "",
-            "45-minute four-row averages:",
-            f"- Average Call / Put: "
-            f"{format_number(analysis.average_call)} / "
-            f"{format_number(analysis.average_put)}",
-            f"- Average Diff: {format_number(analysis.average_diff)}",
-            f"- Average PCR: {format_number(analysis.average_pcr)}",
-            f"- Average Price / VWAP: "
-            f"{format_number(analysis.average_price)} / "
-            f"{format_number(analysis.average_vwap)}",
-            (
-                f"- Average normalized imbalance: "
-                f"{analysis.imbalance:+.3f}"
-                if analysis.imbalance is not None
-                else "- Average normalized imbalance: n/a"
-            ),
-            "",
-            "Latest-row and momentum checks:",
-            f"- Current PCR: {format_number(analysis.current_pcr)}"
-            f"{pcr_change_text}",
-            f"- Call total change: {format_percent(analysis.call_change_pct)}",
-            f"- Put total change: {format_percent(analysis.put_change_pct)}",
-            f"- Call/Put Diff change: {format_number(analysis.diff_change)}",
-            (
-                f"- Latest normalized imbalance: "
-                f"{analysis.latest_imbalance:+.3f}"
-                if analysis.latest_imbalance is not None
-                else "- Latest normalized imbalance: n/a"
-            ),
-            f"- Price / VWAP: {format_number(latest.price)} / "
-            f"{format_number(latest.vwap)}",
-            f"- Latest signals: Option={latest.option_signal or 'n/a'}, "
-            f"VWAP={latest.vwap_signal or 'n/a'}",
+            "Data warning: NIFTY/BANKNIFTY title was not identified.",
         ])
-
-    if analysis.component_scores:
-        component_labels = {
-            "flow_momentum": "45-minute Call/Put flow",
-            "average_balance": "four-row average Call/Put balance",
-            "price_vwap": "average price and VWAP",
-            "option_signal": "Option Signal",
-            "vwap_signal": "VWAP Signal",
-            "strike_confirmation": "strike-table confirmation",
-        }
-        lines.extend(["", "Composite components:"])
-        for name, value in analysis.component_scores.items():
-            lines.append(
-                f"- {component_labels.get(name, name)}: {value:+.3f}"
-            )
-
-    for minutes in sorted(timeframe_analyses, reverse=True):
-        comparison = strike_comparisons.get(minutes)
-        if comparison is None:
-            comparison = TimeframeStrikeComparison(
-                horizon_minutes=minutes,
-                current_time=format_snapshot_clock(captured_at, config),
-                previous_time=None,
-                movers=[],
-                current_strike_count=len(current_rows),
-                common_strike_count=0,
-                status="NO COMPARABLE SNAPSHOT",
-            )
-        lines.extend(timeframe_strike_comparison_lines(
-            comparison,
-            strike_mover_limit,
-        ))
-        lines.extend(option_probability_lines(
-            option_probabilities.get(minutes, []),
-            minutes,
-            config,
-        ))
-
     lines.extend([
         "",
-        "Estimated OI support and resistance:",
-        f"- Primary support: {format_number(levels.primary_support)}",
-        f"- Developing support: {format_number(levels.developing_support)}",
-        f"- Weakening support: {format_number(levels.weakening_support)}",
-        f"- Primary resistance: {format_number(levels.primary_resistance)}",
-        f"- Developing resistance: {format_number(levels.developing_resistance)}",
-        f"- Weakening resistance: {format_number(levels.weakening_resistance)}",
-        f"- Level confidence: {confidence_label(levels.confidence)} "
-        f"({levels.confidence}%)",
-        "- These are OI-derived estimates, not guaranteed turning points.",
-    ])
-
-    if explanations:
-        lines.extend(["", "Signal checks:"])
-        lines.extend(f"- {item}" for item in explanations[:6])
-
-    lines.extend(["", "Plain-language meaning:"])
-    lines.extend(
-        f"- {item}"
-        for item in simple_meaning(
-            direction,
-            current_support,
-            current_resistance,
-        )
-    )
-
-    if previous_snapshot is None:
-        lines.extend([
-            "",
-            "External snapshot comparison: baseline saved. "
-            "The 45-minute result above still uses the rows within this image.",
-        ])
-    else:
-        lines.append(
-            ""
-            "Compared with prior snapshot: "
-            f"{format_snapshot_clock(str(previous_snapshot['captured_at']), config)}"
-        )
-        if comparison_seconds is not None:
-            lines.append(
-                f"External snapshot gap: {elapsed_text(comparison_seconds)}"
-            )
-
-    bullish_rows = sum(
-        1 for item in differences if item.get("row_score", 0) > 0
-    )
-    bearish_rows = sum(
-        1 for item in differences if item.get("row_score", 0) < 0
-    )
-    mixed_rows = sum(
-        1 for item in differences if item.get("row_score", 0) == 0
-    )
-    lines.extend([
-        "",
-        "Strike-table confirmation:",
-        f"- Bullish / bearish / mixed rows: "
-        f"{bullish_rows} / {bearish_rows} / {mixed_rows}",
-        f"- OI support / resistance: "
-        f"{format_number(current_support)} / {format_number(current_resistance)}",
-        f"- Strikes read: {len(current_rows)}",
-        f"- Data quality: {quality} (OCR {average_ocr_confidence}%)",
+        f"Data quality: {quality.upper()} (OCR {average_ocr_confidence}%)",
     ])
     if quality == "Low":
         lines.append(
-            "- Warning: strike OCR quality is low; treat strike confirmation as weak."
+            "Data warning: Image reading quality is low. Wait for a clean update."
         )
+    lines.extend([
+        "",
+        "This is a market-data summary, not an automatic trade order.",
+    ])
+    return "\n".join(lines)
+
+
+def build_recent_instrument_report(
+    instrument: str,
+    captured_at: str,
+    minutes: int,
+    analysis: MarketAnalysis,
+    current_rows: dict[float, StrikeRow],
+    intraday_trend_rows: list[IntradayTrendRow],
+    image_count: int,
+    option_probabilities: list[OptionProbabilityResult],
+    config: dict[str, Any],
+) -> str:
+    """Build one simple on-demand report for a selected recent window."""
+
+    quality, average_ocr_confidence = data_quality(
+        current_rows,
+        float(config["minimum_summary_row_confidence"]),
+    )
+    levels = estimate_support_resistance(
+        current_rows.values(),
+        analysis.current_price,
+    )
+    row_by_time = {row.time_text: row for row in intraday_trend_rows}
+    ordered_window_times = sorted(
+        set(analysis.window_times),
+        key=lambda value: (
+            parse_clock_word(value) or (99, 99, 99)
+        ),
+    )
+    latest_row = (
+        row_by_time.get(ordered_window_times[-1])
+        if ordered_window_times
+        else intraday_trend_rows[0] if intraday_trend_rows else None
+    )
+
+    def easy_direction(value: str) -> str:
+        return {
+            "BULLISH": "UP",
+            "BEARISH": "DOWN",
+            "BALANCED": "SIDEWAYS",
+            "UP": "UP",
+            "DOWN": "DOWN",
+            "FLAT": "SIDEWAYS",
+        }.get(value.upper(), "WAITING FOR DATA")
+
+    view = (
+        "WAITING FOR MORE DATA"
+        if analysis.state == "UNCONFIRMED"
+        else f"{easy_direction(analysis.predicted_label)} "
+        f"(confidence {analysis.confidence}%)"
+    )
+    window_text = (
+        f"{ordered_window_times[0]} to {ordered_window_times[-1]} IST"
+        if ordered_window_times
+        else "complete image window unavailable"
+    )
+    captured_clock = format_snapshot_clock(captured_at, config)
+    latest_valid_clock = (
+        f"{ordered_window_times[-1]} IST"
+        if ordered_window_times
+        else None
+    )
+    lines = [
+        f"{instrument} — LAST {minutes}-MINUTE EASY REPORT",
+        f"Latest table time: {captured_clock}",
+        f"Stored images used: {image_count}",
+        f"Data window used: {window_text}",
+        "",
+        f"Current price: {format_exact_number(analysis.current_price)}",
+        (
+            f"VWAP: {format_exact_number(latest_row.vwap)}"
+            if latest_row is not None
+            else "VWAP: n/a"
+        ),
+        f"Current direction: {easy_direction(analysis.current_condition)}",
+        f"{minutes}-minute view: {view}",
+        "",
+        f"Support strike: {format_exact_number(levels.primary_support)}",
+        f"Resistance strike: {format_exact_number(levels.primary_resistance)}",
+        "",
+    ]
+
+    ready_setup = next(
+        (
+            result
+            for result in option_probabilities
+            if result.model_signal != "NO TRADE"
+        ),
+        None,
+    )
+    if ready_setup is None:
+        lines.extend([
+            "Option selling decision: WAIT",
+            "No option-selling setup passed every safety check.",
+        ])
+    else:
+        lines.extend([
+            "Option selling decision: YES — DEFINED-RISK SPREAD",
+            f"Sell strike: {format_exact_number(ready_setup.strike)} "
+            f"{ready_setup.option_type}",
+            f"Hedge strike: {format_exact_number(ready_setup.hedge_strike)} "
+            f"{ready_setup.option_type}",
+            "Do not sell the option without the displayed hedge.",
+        ])
+
+    reasons: list[str] = []
+    if latest_row is not None and latest_row.price is not None:
+        if latest_row.vwap is None:
+            reasons.append("VWAP could not be read reliably.")
+        elif latest_row.price < latest_row.vwap:
+            reasons.append("Price is below VWAP.")
+        elif latest_row.price > latest_row.vwap:
+            reasons.append("Price is above VWAP.")
+        else:
+            reasons.append("Price is at VWAP.")
+    reasons.append({
+        "BEARISH_STRENGTHENING": "Downward pressure is strengthening.",
+        "BEARISH_WEAKENING": "Downward pressure is weakening.",
+        "BULLISH_STRENGTHENING": "Upward pressure is strengthening.",
+        "BULLISH_WEAKENING": "Upward pressure is weakening.",
+        "REVERSAL_WATCH": "A possible reversal is not confirmed yet.",
+        "UNCONFIRMED": f"A complete {minutes}-minute window was not available.",
+    }.get(
+        analysis.state,
+        "Wait for another confirmed update if the direction is unclear.",
+    ))
+    if ready_setup is None:
+        reasons.append("Do not sell options until every safety check passes.")
 
     lines.extend([
         "",
-        "This is an OCR and statistical analysis, not an automatic trade order.",
+        "Reason:",
+        *reasons,
+    ])
+    if latest_valid_clock is not None and latest_valid_clock != captured_clock:
+        lines.extend([
+            "",
+            "Data warning: The latest valid Intraday Trend row used was "
+            f"{latest_valid_clock}, but the image time was {captured_clock}.",
+            "The newest row may not have been read correctly; check OCR debug.",
+        ])
+    lines.extend([
+        "",
+        f"Data quality: {quality.upper()} (OCR {average_ocr_confidence}%)",
+        "",
+        "This is a market-data summary, not an automatic trade order.",
     ])
     return "\n".join(lines)
+
+
+def regenerate_recent_reports(
+    minutes: int,
+    config: dict[str, Any],
+) -> Path:
+    """Rebuild a selected recent-window report for NIFTY and BANKNIFTY."""
+
+    if minutes not in {15, 30, 45}:
+        raise ValueError("Report window must be 15, 30, or 45 minutes.")
+
+    market_timezone = configured_market_timezone(config)
+    market_day = datetime.now(market_timezone).date().isoformat()
+    connection = connect_database()
+    sections: list[str] = []
+    try:
+        for instrument in ("NIFTY", "BANKNIFTY"):
+            snapshot = connection.execute(
+                """
+                SELECT *
+                FROM snapshots
+                WHERE instrument = ?
+                  AND substr(captured_at, 1, 10) = ?
+                  AND row_count > 0
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 1
+                """,
+                (instrument, market_day),
+            ).fetchone()
+            if snapshot is None:
+                sections.append("\n".join([
+                    f"{instrument} — LAST {minutes}-MINUTE EASY REPORT",
+                    "",
+                    f"ERROR: {instrument} data is not available for {market_day}.",
+                    "Check the Telegram source images and OCR debug files.",
+                ]))
+                continue
+
+            snapshot_id = int(snapshot["id"])
+            captured_at = str(snapshot["captured_at"])
+            current_rows = load_rows(connection, snapshot_id)
+            trend_rows, image_count = load_recent_intraday_rows_from_images(
+                connection=connection,
+                instrument=instrument,
+                market_day=market_day,
+                latest_captured_at=captured_at,
+                minutes=minutes,
+            )
+            target_time = (
+                parse_iso_datetime(captured_at) - timedelta(minutes=minutes)
+            ).isoformat()
+            previous = connection.execute(
+                """
+                SELECT *
+                FROM snapshots
+                WHERE instrument = ?
+                  AND substr(captured_at, 1, 10) = ?
+                  AND captured_at <= ?
+                  AND row_count > 0
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 1
+                """,
+                (instrument, market_day, target_time),
+            ).fetchone()
+            strike_direction = "BASELINE"
+            if previous is not None:
+                _, strike_direction, _, _ = compare_snapshots(
+                    load_rows(connection, int(previous["id"])),
+                    current_rows,
+                    config,
+                )
+
+            analysis = analyze_market_window(
+                trend_rows,
+                strike_direction,
+                config,
+                horizon_minutes=minutes,
+            )
+            probabilities = estimate_option_probabilities(
+                connection=connection,
+                instrument=instrument,
+                current_rows=current_rows,
+                analysis=analysis,
+                config=config,
+                intraday_trend_rows=trend_rows,
+                volume_confirmation=None,
+            )
+            sections.append(build_recent_instrument_report(
+                instrument=instrument,
+                captured_at=captured_at,
+                minutes=minutes,
+                analysis=analysis,
+                current_rows=current_rows,
+                intraday_trend_rows=trend_rows,
+                image_count=image_count,
+                option_probabilities=probabilities,
+                config=config,
+            ))
+    finally:
+        connection.close()
+
+    output_directory = REPORT_DIR / market_day
+    output_directory.mkdir(parents=True, exist_ok=True)
+    output_path = (
+        output_directory
+        / f"regenerated_{minutes}min_combined_report.txt"
+    )
+    output_path.write_text(
+        ("\n\n" + "=" * 64 + "\n\n").join(sections),
+        encoding="utf-8",
+    )
+    LOGGER.info(
+        "Regenerated last-%d-minute NIFTY and BANKNIFTY report: %s",
+        minutes,
+        output_path,
+    )
+    print(f"REPORT_PATH={output_path}", flush=True)
+    return output_path
 
 
 # -----------------------------------------------------------------------------
@@ -5603,6 +6379,8 @@ def process_image(
                 current_rows=current_map,
                 analysis=timeframe_analysis,
                 config=config,
+                intraday_trend_rows=intraday_trend_rows,
+                volume_confirmation=None,
             )
             for minutes, timeframe_analysis in timeframe_analyses.items()
         }
@@ -6080,6 +6858,14 @@ async def run_live_monitor(
                             attempt,
                         )
                         await asyncio.sleep(wait_seconds)
+                    except errors.ChatAdminRequiredError:
+                        LOGGER.error(
+                            "Telegram cannot post to @%s. Add the logged-in "
+                            "account as a channel administrator with Post "
+                            "Messages permission, then retry delivery.",
+                            str(report_target).lstrip("@"),
+                        )
+                        return False
                     except Exception:
                         LOGGER.exception(
                             "Telegram report delivery failed; monitoring will "
@@ -6088,6 +6874,11 @@ async def run_live_monitor(
                         return False
                 if not delivered:
                     return False
+            LOGGER.info(
+                "Telegram report delivered to %s (%d part(s)).",
+                report_target,
+                total_parts,
+            )
             return True
 
     async def download_process_and_report(
@@ -6319,6 +7110,15 @@ def parse_arguments() -> argparse.Namespace:
             "ones, and then keep monitoring new posts."
         ),
     )
+    parser.add_argument(
+        "--regenerate-minutes",
+        type=int,
+        choices=(15, 30, 45),
+        help=(
+            "Rebuild one easy report for NIFTY and BANKNIFTY using the "
+            "latest stored 15, 30, or 45-minute image window, then exit."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -6328,6 +7128,10 @@ def main() -> None:
     configure_tesseract()
     config = load_config()
     organize_downloaded_images_by_day(config)
+
+    if args.regenerate_minutes is not None:
+        regenerate_recent_reports(args.regenerate_minutes, config)
+        return
 
     if args.existing_only:
         if bool(config["process_existing_images_on_start"]):

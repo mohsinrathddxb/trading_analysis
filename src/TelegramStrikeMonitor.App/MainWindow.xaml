@@ -2,11 +2,13 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Telegram Strike Monitor"
+        Icon="Assets/AppLogo.ico"
         Width="1320"
         Height="850"
         MinWidth="1050"
         MinHeight="700"
         WindowStartupLocation="CenterScreen"
+        ContentRendered="Window_ContentRendered"
         Closing="Window_Closing">
     <Grid>
         <Grid.RowDefinitions>
@@ -57,6 +59,35 @@
                                 <Button x:Name="StopButton" Content="Stop" Style="{StaticResource DangerButton}" IsEnabled="False" Click="StopButton_Click"/>
                             </WrapPanel>
                             <Button Content="Regenerate downloaded-image reports" Style="{StaticResource SecondaryButton}" HorizontalAlignment="Stretch" Click="RegenerateButton_Click"/>
+                            <TextBlock Text="Re-generate easy NIFTY + BANKNIFTY report"
+                                       FontWeight="SemiBold" Margin="0,6,0,6"/>
+                            <UniformGrid Columns="3">
+                                <Button x:Name="Regenerate15Button" Content="Last 15 min"
+                                        Style="{StaticResource SecondaryButton}"
+                                        Click="Regenerate15Button_Click"/>
+                                <Button x:Name="Regenerate30Button" Content="Last 30 min"
+                                        Style="{StaticResource SecondaryButton}"
+                                        Click="Regenerate30Button_Click"/>
+                                <Button x:Name="Regenerate45Button" Content="Last 45 min"
+                                        Style="{StaticResource SecondaryButton}"
+                                        Click="Regenerate45Button_Click"/>
+                            </UniformGrid>
+                            <TextBlock Text="Uses the latest stored images without stopping live monitoring."
+                                       FontSize="12" Foreground="{StaticResource TextSecondary}"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource Card}">
+                        <StackPanel>
+                            <TextBlock Text="Application update" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock x:Name="VersionText" Text="Version" Foreground="{StaticResource TextSecondary}" Margin="0,4,0,0"/>
+                            <TextBlock x:Name="UpdateStatusText" Text="Update status unavailable."
+                                       Foreground="{StaticResource TextSecondary}" Margin="0,4,0,12" TextWrapping="Wrap"/>
+                            <Button x:Name="UpdateButton" Content="Update and restart"
+                                    HorizontalAlignment="Stretch" Click="UpdateButton_Click"/>
+                            <TextBlock Text="Preserves credentials, Telegram session, database, images, reports, and settings."
+                                       FontSize="12" Foreground="{StaticResource TextSecondary}" TextWrapping="Wrap"/>
                         </StackPanel>
                     </Border>
 
@@ -65,7 +96,7 @@
                             <TextBlock Text="Engine paths" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource TextPrimary}"/>
                             <TextBlock Text="The app keeps the existing Python analysis engine." Foreground="{StaticResource TextSecondary}" Margin="0,4,0,12" TextWrapping="Wrap"/>
 
-                            <TextBlock Text="Python executable" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                            <TextBlock Text="Engine / Python executable" FontWeight="SemiBold" Margin="0,0,0,4"/>
                             <Grid Margin="0,0,0,10">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
@@ -117,6 +148,21 @@
                                 <TextBlock Grid.Row="2" Text="Last report" Foreground="{StaticResource TextSecondary}" Margin="0,6,0,0"/>
                                 <TextBlock x:Name="LastReportTimeText" Grid.Row="2" Grid.Column="1" Text="—" FontWeight="Bold" Margin="12,6,0,0"/>
                             </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border x:Name="DataHealthBorder" Style="{StaticResource Card}" Background="#EEF2F7">
+                        <StackPanel>
+                            <TextBlock x:Name="DataHealthTitleText"
+                                       Text="Market data health"
+                                       FontSize="18"
+                                       FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextPrimary}"/>
+                            <TextBlock x:Name="DataHealthText"
+                                       Text="Waiting for NIFTY and BANKNIFTY reports."
+                                       Foreground="{StaticResource TextSecondary}"
+                                       Margin="0,6,0,0"
+                                       TextWrapping="Wrap"/>
                         </StackPanel>
                     </Border>
                 </StackPanel>

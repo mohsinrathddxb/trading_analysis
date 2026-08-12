@@ -1,0 +1,23 @@
+Telegram Strike Monitor 1.2.2 - Windows x64
+================================================
+
+Setup file:
+  TelegramStrikeMonitor-Setup-1.2.2-win-x64.exe
+
+SHA-256:
+  BAF252688F2464927A5FF3B38C61253446795A2B255139FF70EFE8BEE5860C1A
+
+Installation:
+  1. Download the setup EXE through Git LFS or from the GitHub file page.
+  2. Run the setup file on a 64-bit Windows computer.
+  3. Start Telegram Strike Monitor from the desktop or Start menu shortcut.
+  4. Complete the first-run Telegram setup and one-time phone/code authorization.
+
+The installer includes the self-contained WPF application, portable Python
+runtime, Python packages, and English Tesseract OCR runtime. It does not
+include Telegram credentials, session files, market databases, downloaded
+images, or generated reports.
+
+Validated on 2026-08-12 using an isolated silent installation. The installed
+application reported FileVersion 1.2.2.0, and the bundled Python and Tesseract
+executables were present.

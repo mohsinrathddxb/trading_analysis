@@ -16,3 +16,5 @@ python/market_snapshots.sqlite3
 python/market_snapshots_backup_*.sqlite3
 *.user
 *.suo
+.update-work/
+artifacts/

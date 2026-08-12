@@ -35,7 +35,39 @@ The application targets `net8.0-windows`.
 5. Set `TelegramStrikeMonitor.App` as the startup project.
 6. Press `F5`.
 7. The app normally detects `python/.venv/Scripts/python.exe`. Use Browse only when your interpreter is elsewhere.
-8. Choose **Today catch-up + live monitoring** and select **Start monitor**.
+8. The app automatically starts **Today catch-up + live monitoring** when its window opens.
+
+The desktop app now provides one-click operation: opening it automatically
+starts today's catch-up and live monitoring. The manual Start and Stop controls
+remain available for troubleshooting.
+
+Three on-demand buttons create fresh easy reports from the latest stored
+NIFTY and BANKNIFTY images: **Last 15 min**, **Last 30 min**, and **Last 45
+min**. Regeneration runs as a separate short-lived process, so live Telegram
+monitoring continues. Each output contains both instruments and is written as
+`regenerated_<minutes>min_combined_report.txt` in the current market-day
+report folder, then loaded into the dashboard.
+
+The dashboard also checks the current market-day reports for both NIFTY and
+BANKNIFTY. During market hours it shows the latest time received for each
+instrument. If one feed is missing, falls behind the other, becomes stale, or a
+corresponding screenshot cannot be identified by OCR, the dashboard turns the
+market-data health card red and shows a rate-limited warning message box with
+the affected instrument and the last successfully received times.
+
+## Updating and restarting
+
+Select **Update and restart** in the desktop app to run the external updater.
+It safely stops monitoring, preserves `.env`, Telegram sessions, databases,
+images, reports, and local settings, checks the GitHub `origin/main` source,
+installs Python requirements, runs the regression tests, builds into a staging
+folder, deploys the verified build, and reopens the app. Monitoring starts
+automatically after relaunch. If deployment fails, the updater restores and
+restarts the previous application build.
+
+When tracked local source edits exist, the updater does not pull or overwrite
+them. It builds and tests the local working tree instead. Commit or otherwise
+resolve local edits before using the button to fetch later GitHub changes.
 
 ## 45-minute direction analysis
 
@@ -78,9 +110,11 @@ recomputed as `Put - Call`.
 Snapshot analysis files are written under the market-date directory
 `python/reports/YYYY-MM-DD/`, which is created automatically:
 
-- `snapshot_<id>_combined_report.txt` — the combined view arranged as
-  45 minutes, 30 minutes, then 15 minutes; this is the single report sent to
-  Telegram and shown as latest in the app.
+- `snapshot_<id>_combined_report.txt` — the easy-reading report sent to
+  Telegram and shown as latest in the app. It shows the current price and
+  VWAP, simple 15/30/45-minute views, exact support and resistance strikes,
+  one option-selling decision, short reasons, and data quality. Prices and
+  strikes are never abbreviated as K/L/Cr.
 - `snapshot_<id>_15min_report.txt`, `snapshot_<id>_30min_report.txt`, and
   `snapshot_<id>_45min_report.txt` — standalone detailed reports containing
   the rows used, Call/Put/Diff/PCR averages, momentum, forecast, component
@@ -95,10 +129,27 @@ Snapshot analysis files are written under the market-date directory
   probability table by strike and option type. A win is measured from later
   observed LTP after the configured round-trip cost. Results include sample
   size, a 95% Wilson interval, average winning/losing return, expected value,
-  and an OCR/data-quality filter. Probability remains `n/a` until at least 50
-  matching completed outcomes exist. Buy/sell candidates require the
+  and an OCR/data-quality filter. Probability remains `n/a` until at least 100
+  independent completed timestamps across 20 trading days exist. Sell
+  candidates require the
   direction, probability, expected-value, and quality gates to agree; option
   selling is labeled as requiring a defined-risk hedge.
+- Option-selling candidates now use a strict all-gates rule. The historical
+  sample must contain at least 100 independent timestamps across 20 trading
+  days, the estimated win rate must be at least 60%, its 95% lower confidence
+  bound must be at least 52%, and net expected value must be positive. The
+  historical tail loss and current credit-spread maximum loss must also remain
+  within configured limits.
+- VWAP and 9/21 EMA direction, selected-side OI buildup, minimum premium/OCR
+  quality, verified traded volume, and an available farther-OTM hedge must all
+  confirm. Every pass/fail result and its evidence is printed in the report.
+  Because the current screenshots do not expose verified traded volume, that
+  gate remains `N/A` and safely blocks a sell signal until a real volume source
+  is added. OI is never relabeled as volume.
+- Option exits must match their exact 15/30/45-minute target within 90 seconds.
+  Missing targets remain unevaluated instead of borrowing the next 15-minute
+  snapshot. Correlated strikes at one market time are collapsed into one
+  median outcome before probability and confidence calculations.
 - Combined reports longer than one Telegram message are sent in numbered
   parts so the strike comparison and conclusion are not truncated.
 - `snapshot_<id>_strike_diff.csv` — strike-by-strike comparison data for the
@@ -157,12 +208,33 @@ git switch -c feature/improve-intraday-time-ocr
 
 ## Build a Windows executable
 
-In Visual Studio, use **Build > Publish** for the WPF project. The Windows application still needs:
+In Visual Studio, use **Build > Publish** for the WPF project. A normal framework-dependent publish still needs:
 
 - the included `python` engine folder;
 - a configured Python environment;
 - Tesseract OCR;
 - Telegram `.env` and session authorization.
 
-A later phase can bundle the Python engine with PyInstaller or migrate the engine to C# for a fully
-self-contained installer.
+For deployment to another Windows x64 computer, use the safe offline installer
+described below; it bundles the required application and OCR runtimes.
+
+## Safe installer for another Windows computer
+
+The Windows x64 installer is built from `installer/TelegramStrikeMonitor.iss`.
+It contains the self-contained WPF application, a portable Python runtime,
+Python OCR dependencies, and the English Tesseract runtime. It intentionally
+does not contain `python/.env`, Telegram session files, databases, downloaded
+images, or reports.
+
+The ready-to-install Windows x64 setup for version 1.2.2 is stored at:
+
+`installer/releases/TelegramStrikeMonitor-Setup-1.2.2-win-x64.exe`
+
+Git LFS is used for the installer binary. The accompanying SHA-256 checksum
+and installation notes are in the same folder.
+
+On first launch, the application asks for the Telegram API ID, API hash,
+source channel, and report destination. These values are written only to the
+installed computer. It then opens a one-time console for Telegram phone/code
+authorization. After authorization succeeds, catch-up and live monitoring
+start automatically.

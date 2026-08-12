@@ -58,7 +58,19 @@ public sealed class PythonMonitorService : IDisposable
         {
             if (e.Data is not null)
             {
-                OutputReceived?.Invoke(this, "ERROR | " + e.Data);
+                // Python's logging module writes every level to stderr by
+                // default. Preserve structured INFO/WARNING/ERROR levels so
+                // routine engine activity is not mislabeled as an error.
+                string line = e.Data;
+                bool hasStructuredLevel =
+                    line.Contains(" | DEBUG | ", StringComparison.Ordinal)
+                    || line.Contains(" | INFO | ", StringComparison.Ordinal)
+                    || line.Contains(" | WARNING | ", StringComparison.Ordinal)
+                    || line.Contains(" | ERROR | ", StringComparison.Ordinal)
+                    || line.Contains(" | CRITICAL | ", StringComparison.Ordinal);
+                OutputReceived?.Invoke(
+                    this,
+                    hasStructuredLevel ? line : "ERROR | " + line);
             }
         };
         _process.Exited += (_, _) =>
