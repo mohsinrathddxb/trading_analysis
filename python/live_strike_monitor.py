@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import csv
 import hashlib
 import json
@@ -5762,6 +5763,7 @@ def build_market_report(
     lines = [
         f"{instrument or 'MARKET'} EASY REPORT — "
         f"{format_snapshot_clock(captured_at, config)}",
+        f"Latest table time: {format_snapshot_clock(captured_at, config)}",
         "",
         f"Current price: {format_exact_number(analysis.current_price)}",
         (
@@ -6458,24 +6460,63 @@ def process_image(
         )
         report_path.write_text(report_text, encoding="utf-8")
 
-        for minutes, timeframe_analysis in sorted(
-            timeframe_analyses.items(),
-            reverse=True,
-        ):
-            timeframe_report = build_timeframe_report(
-                snapshot_id=snapshot_id,
-                captured_at=captured_at,
-                instrument=instrument,
+        market_day = report_day_folder_name(captured_at, config)
+        for minutes in sorted(timeframe_analyses, reverse=True):
+            recent_rows, image_count = load_recent_intraday_rows_from_images(
+                connection=connection,
+                instrument=instrument or "",
+                market_day=market_day,
+                latest_captured_at=captured_at,
+                minutes=minutes,
+            )
+            target_time = (
+                parse_iso_datetime(captured_at) - timedelta(minutes=minutes)
+            ).isoformat()
+            recent_previous = connection.execute(
+                """
+                SELECT *
+                FROM snapshots
+                WHERE instrument = ?
+                  AND substr(captured_at, 1, 10) = ?
+                  AND captured_at <= ?
+                  AND row_count > 0
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 1
+                """,
+                (instrument, market_day, target_time),
+            ).fetchone()
+            recent_strike_direction = "BASELINE"
+            if recent_previous is not None:
+                _, recent_strike_direction, _, _ = compare_snapshots(
+                    load_rows(connection, int(recent_previous["id"])),
+                    current_map,
+                    config,
+                )
+            recent_analysis = analyze_market_window(
+                recent_rows,
+                recent_strike_direction,
+                config,
+                horizon_minutes=minutes,
+            )
+            recent_probabilities = estimate_option_probabilities(
+                connection=connection,
+                instrument=instrument or "",
                 current_rows=current_map,
-                differences=differences,
-                analysis=timeframe_analysis,
-                intraday_trend_rows=intraday_trend_rows,
-                comparison_status=comparison_status,
-                previous_snapshot=previous_snapshot,
-                comparison_seconds=comparison_seconds,
+                analysis=recent_analysis,
                 config=config,
-                strike_comparison=timeframe_strike_comparisons.get(minutes),
-                option_probabilities=option_probabilities.get(minutes, []),
+                intraday_trend_rows=recent_rows,
+                volume_confirmation=None,
+            )
+            timeframe_report = build_recent_instrument_report(
+                instrument=instrument or "MARKET",
+                captured_at=captured_at,
+                minutes=minutes,
+                analysis=recent_analysis,
+                current_rows=current_map,
+                intraday_trend_rows=recent_rows,
+                image_count=image_count,
+                option_probabilities=recent_probabilities,
+                config=config,
             )
             timeframe_path = (
                 report_directory
@@ -6824,6 +6865,11 @@ async def run_live_monitor(
     )
     processing_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
+    handled_message_ids: set[int] = set()
+    recovery_poll_seconds = max(
+        15,
+        int(config.get("telegram_recovery_poll_seconds", 30)),
+    )
 
     async def send_telegram_message(text: str) -> bool:
         """Send without allowing Telegram rate limits to stop the monitor."""
@@ -6902,12 +6948,16 @@ async def run_live_monitor(
             )
 
         async with processing_lock:
+            if message_id in handled_message_ids:
+                return None
+
             already_done = await asyncio.to_thread(
                 telegram_message_already_processed,
                 channel,
                 message_id,
             )
             if already_done:
+                handled_message_ids.add(message_id)
                 LOGGER.info(
                     "Already processed Telegram message %s",
                     message_id,
@@ -6979,6 +7029,11 @@ async def run_live_monitor(
                     ),
                 )
                 return None
+
+            # A valid snapshot and a deliberate OCR warning are both handled
+            # outcomes. Only exceptions/download failures remain retryable.
+            if result is not None:
+                handled_message_ids.add(message_id)
 
             if (
                 result
@@ -7065,7 +7120,64 @@ async def run_live_monitor(
         message = event.message
         if not is_image_message(message):
             return
-        await download_process_and_report(message)
+        try:
+            LOGGER.info(
+                "New Telegram image event received: message %s",
+                message.id,
+            )
+            await download_process_and_report(message)
+        except Exception:
+            # An event-handler error must never remove the live listener.
+            # The recovery poll below will retry this post shortly.
+            LOGGER.exception(
+                "Unexpected live-event failure for Telegram message %s; "
+                "the recovery poll will retry it.",
+                message.id,
+            )
+
+    async def recover_missed_recent_images() -> int:
+        """Process recent images that were missed by the live event stream."""
+
+        recent_images: list[Any] = []
+        async for message in client.iter_messages(channel, limit=50):
+            if is_image_message(message):
+                recent_images.append(message)
+
+        processed_count = 0
+        for message in reversed(recent_images):
+            if int(message.id) in handled_message_ids:
+                continue
+            already_done = await asyncio.to_thread(
+                telegram_message_already_processed,
+                channel,
+                int(message.id),
+            )
+            if already_done:
+                continue
+            result = await download_process_and_report(message)
+            if result is not None:
+                processed_count += 1
+        if processed_count:
+            LOGGER.warning(
+                "Recovery poll found and processed %d missed Telegram image(s).",
+                processed_count,
+            )
+        return processed_count
+
+    async def recovery_poll_loop() -> None:
+        """Continuously recover missed posts while live monitoring is active."""
+
+        while True:
+            await asyncio.sleep(recovery_poll_seconds)
+            try:
+                await recover_missed_recent_images()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception(
+                    "Telegram recovery poll failed; retrying in %d seconds.",
+                    recovery_poll_seconds,
+                )
 
     await client.start()
     me = await client.get_me()
@@ -7085,8 +7197,18 @@ async def run_live_monitor(
         await catch_up_images_posted_today()
 
     LOGGER.info("Monitoring @%s for new images", channel)
+    LOGGER.info(
+        "Missed-image recovery check runs every %d seconds",
+        recovery_poll_seconds,
+    )
     LOGGER.info("Reports will be sent to %s", report_target)
-    await client.run_until_disconnected()
+    recovery_task = asyncio.create_task(recovery_poll_loop())
+    try:
+        await client.run_until_disconnected()
+    finally:
+        recovery_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await recovery_task
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

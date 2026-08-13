@@ -614,6 +614,7 @@ class PredictionLogicTests(unittest.TestCase):
         )
 
         self.assertIn("NIFTY EASY REPORT", report)
+        self.assertIn("Latest table time: 13:45 IST", report)
         self.assertIn("Current price: 24242", report)
         self.assertIn("15-minute view:", report)
         self.assertIn("30-minute view:", report)

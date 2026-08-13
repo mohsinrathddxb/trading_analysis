@@ -39,6 +39,9 @@ public partial class MainWindow : Window
     private static readonly Regex LatestTableTimePattern = new(
         @"^Latest table time:\s*(?<hour>\d{1,2}):(?<minute>\d{2})\s+IST",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex EasyReportHeaderTimePattern = new(
+        @"\bEASY REPORT\b.*?(?<hour>\d{1,2}):(?<minute>\d{2})\s+IST\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public MainWindow()
     {
@@ -640,7 +643,7 @@ public partial class MainWindow : Window
         MessageBox.Show(
             this,
             health.AlertMessage,
-            "NIFTY / BANKNIFTY data warning",
+            "Market data warning",
             MessageBoxButton.OK,
             MessageBoxImage.Warning);
     }
@@ -768,9 +771,31 @@ public partial class MainWindow : Window
                     >= newestReport.File.LastWriteTimeUtc.AddMinutes(-2));
         if (affected.Count > 0)
         {
-            string detail = unidentifiedIsNew
-                ? "A recent screenshot was saved as MARKET because its instrument title or table time was not recognized."
-                : "One or both expected index reports are late or missing.";
+            string detail;
+            if (unidentifiedIsNew)
+            {
+                detail = "A recent screenshot was saved as MARKET because its instrument title or table time was not recognized.";
+            }
+            else if (nifty is null && bankNifty is null)
+            {
+                detail = "No readable NIFTY or BANKNIFTY report was found for today.";
+            }
+            else if (nifty is null)
+            {
+                detail = "No readable NIFTY report was found for today; BANKNIFTY is being received.";
+            }
+            else if (bankNifty is null)
+            {
+                detail = "No readable BANKNIFTY report was found for today; NIFTY is being received.";
+            }
+            else if (affected.Count == 2)
+            {
+                detail = $"Neither index has received a fresh report for at least {StaleFeedTolerance.TotalMinutes:g} minutes.";
+            }
+            else
+            {
+                detail = $"{affected[0]} is at least {MissingInstrumentTolerance.TotalMinutes:g} minutes behind the other index.";
+            }
             return CreateFeedError(affected, nifty, bankNifty, detail);
         }
 
@@ -824,6 +849,13 @@ public partial class MainWindow : Window
             }
 
             Match match = LatestTableTimePattern.Match(timeLine ?? string.Empty);
+            if (!match.Success)
+            {
+                // Current easy reports carry the market time in their heading.
+                // Keep accepting that format so valid reports are not shown as
+                // "not received" merely because the detail line is absent.
+                match = EasyReportHeaderTimePattern.Match(header);
+            }
             string? dayText = Directory.GetParent(path)?.Name;
             if (!match.Success
                 || !DateTime.TryParseExact(
@@ -859,8 +891,11 @@ public partial class MainWindow : Window
             ? "NIFTY / BANKNIFTY"
             : string.Join(" and ", affectedInstruments.Distinct());
         string times = BuildFeedTimesText(nifty, bankNifty);
-        string status = $"{affected} data is not coming properly on the dashboard. {times}";
-        string message = $"{affected} data is not coming properly on the dashboard.\n\n"
+        string problem = affectedInstruments.Distinct().Count() == 1
+            ? $"{affected} data is late or missing."
+            : "Fresh NIFTY and BANKNIFTY data is late or missing.";
+        string status = $"{problem} {times}";
+        string message = $"Affected feed: {affected}\n\n"
             + $"{times}\n\n{detail}\n\n"
             + "Please check the Telegram source images and OCR debug files. "
             + "Make sure the NIFTY/BANKNIFTY title and Intraday Trend time are fully visible.";

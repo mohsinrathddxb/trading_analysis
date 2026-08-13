@@ -55,6 +55,12 @@ corresponding screenshot cannot be identified by OCR, the dashboard turns the
 market-data health card red and shows a rate-limited warning message box with
 the affected instrument and the last successfully received times.
 
+Live Telegram images are handled immediately by the new-message listener. A
+second recovery check scans recent channel images every 30 seconds, so a post
+missed during a brief Telegram disconnect is downloaded and processed without
+restarting the application. The interval can be changed with
+`telegram_recovery_poll_seconds` in `python/monitor_config.json`.
+
 ## Updating and restarting
 
 Select **Update and restart** in the desktop app to run the external updater.
@@ -116,24 +122,16 @@ Snapshot analysis files are written under the market-date directory
   one option-selling decision, short reasons, and data quality. Prices and
   strikes are never abbreviated as K/L/Cr.
 - `snapshot_<id>_15min_report.txt`, `snapshot_<id>_30min_report.txt`, and
-  `snapshot_<id>_45min_report.txt` — standalone detailed reports containing
-  the rows used, Call/Put/Diff/PCR averages, momentum, forecast, component
-  scores, an up-to-15-strike Call/Put total-OI comparison for that report's
-  exact timeframe,
-  support/resistance, confirmation, and OCR quality. Strike comparisons show
-  total activity, net Put-minus-Call pressure, dominance, interpretation, and
-  total-OI deltas when available. Each fixed-width TXT table includes the
-  current and comparison times, `|` separators, `+---+` borders, and `n/a`
-  when the required endpoint is unavailable.
-- Each combined and individual report includes a historical option-premium
-  probability table by strike and option type. A win is measured from later
-  observed LTP after the configured round-trip cost. Results include sample
-  size, a 95% Wilson interval, average winning/losing return, expected value,
-  and an OCR/data-quality filter. Probability remains `n/a` until at least 100
-  independent completed timestamps across 20 trading days exist. Sell
-  candidates require the
-  direction, probability, expected-value, and quality gates to agree; option
-  selling is labeled as requiring a defined-risk hedge.
+  `snapshot_<id>_45min_report.txt` — automatic easy reports matching the
+  regenerated-report layout. Each one shows its exact stored-image window,
+  price, VWAP, direction, support/resistance, one option-selling decision,
+  short reasons, and OCR quality.
+- Historical option-premium probabilities are still calculated internally by
+  strike and option type. A win is measured from later observed LTP after the
+  configured round-trip cost. Sell candidates require the direction,
+  probability, expected-value, and quality gates to agree; option selling is
+  labeled as requiring a defined-risk hedge. Full validation data remains in
+  `option_probability_backtest.csv`.
 - Option-selling candidates now use a strict all-gates rule. The historical
   sample must contain at least 100 independent timestamps across 20 trading
   days, the estimated win rate must be at least 60%, its 95% lower confidence
@@ -142,10 +140,11 @@ Snapshot analysis files are written under the market-date directory
   within configured limits.
 - VWAP and 9/21 EMA direction, selected-side OI buildup, minimum premium/OCR
   quality, verified traded volume, and an available farther-OTM hedge must all
-  confirm. Every pass/fail result and its evidence is printed in the report.
-  Because the current screenshots do not expose verified traded volume, that
-  gate remains `N/A` and safely blocks a sell signal until a real volume source
-  is added. OI is never relabeled as volume.
+  confirm. These gates remain enforced even though each easy report shows only
+  the final decision and short reasons. Because the current screenshots do not
+  expose verified traded volume, that gate remains `N/A` and safely blocks a
+  sell signal until a real volume source is added. OI is never relabeled as
+  volume.
 - Option exits must match their exact 15/30/45-minute target within 90 seconds.
   Missing targets remain unevaluated instead of borrowing the next 15-minute
   snapshot. Correlated strikes at one market time are collapsed into one

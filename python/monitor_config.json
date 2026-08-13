@@ -2,6 +2,7 @@
   "channel": "autotrendpcrr",
   "report_target": "me",
   "send_report_to_telegram": true,
+  "telegram_recovery_poll_seconds": 30,
   "minimum_ocr_confidence": 28,
   "ocr_scale": 2.5,
   "strike_min": 1000,
